@@ -150,8 +150,12 @@ class MethodInfo:
     def serialize(self, cp: ConstantPool) -> bytes:
         out = struct.pack(">HHH", self.access_flags, self.name_index, self.descriptor_index)
         out += struct.pack(">H", len(self.attributes))
+        smt = cp.find_utf8("StackMapTable")
         for attr in self.attributes:
-            out += attr.serialize()
+            if isinstance(attr, CodeAttribute):
+                out += attr.serialize(smt)
+            else:
+                out += attr.serialize()
         return out
 
 
@@ -184,8 +188,11 @@ class CodeAttribute:
         self.exception_table = exception_table  # (start_pc, end_pc, handler_pc, catch_type)
         self.attributes = attributes
 
-    def serialize(self) -> bytes:
-        from .code import layout, nearest_new_offset, offset_mapping, serialize_instructions
+    def serialize(self, smt_name: int = 0) -> bytes:
+        from .code import (
+            layout, nearest_new_offset, offset_mapping, remap_stack_map_table,
+            serialize_instructions,
+        )
         layout(self.instructions)
         mapping = offset_mapping(self.instructions)
         code = serialize_instructions(self.instructions)
@@ -202,7 +209,13 @@ class CodeAttribute:
             )
         out += struct.pack(">H", len(self.attributes))
         for attr in self.attributes:
-            out += attr.serialize()
+            if smt_name and attr.name_index == smt_name:
+                # 帧偏移随指令布局重定位（插入/删除指令后必须，否则 JVM 报
+                # VerifyError: StackMapTable error: bad offset）
+                out += struct.pack(">HI", attr.name_index, len(attr.payload)) \
+                    + remap_stack_map_table(attr.payload, mapping)
+            else:
+                out += attr.serialize()
         return struct.pack(">H", self.name_index) + struct.pack(">I", len(out)) + out
 
 

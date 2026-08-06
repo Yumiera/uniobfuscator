@@ -13,6 +13,9 @@ build/
 out/
 config/uniobfuscator.toml
 
+# 本地运行日志
+debug.log
+
 # IDE / 本地工具配置
 .idea/
 .trae/

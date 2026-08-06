@@ -15,6 +15,7 @@ from .classfile import (
     CONSTANT_Methodref,
     CONSTANT_NameAndType,
     CONSTANT_String,
+    Attribute,
     ClassFile,
     CodeAttribute,
     MethodInfo,
@@ -62,10 +63,47 @@ def _cipher(s: str, key: int) -> str:
 # 字符串加密
 # ---------------------------------------------------------------------------
 
+def _build_stack_map_table(class_file: ClassFile, char_arr_class_idx: int,
+                           instructions) -> Attribute:
+    """为解密 helper 生成 StackMapTable 属性（JVMS 4.7.4）。
+
+    class 版本 >= 51（Java 7+）采用 SplitVerifier：任何带分支/跳转的方法
+    都必须携带 StackMapTable，否则 JVM 抛 VerifyError。helper 的 2 个分支
+    目标处 locals 均为 [String, char[], int]，相对隐式帧（由方法描述符推导，
+    即 [String]）追加 2 个局部变量（[C 与 Integer），故首帧用 APPEND(2)，
+    frame_type = 251 + 2 = 253；后续帧 locals 不变，用 SAME 帧。
+
+    帧偏移计算（此前硬编码 delta 导致 ClassFormatError 的根因）：
+      首帧 offset = offset_delta；
+      后续帧 offset = 上一帧 offset + offset_delta + 1。
+    """
+    cp = class_file.cp
+    object_info = bytes([7]) + struct.pack(">H", char_arr_class_idx)  # Object_variable_info("[C")
+    int_info = bytes([1])                                             # Integer_variable_info
+    # 分支目标（绝对偏移，升序）即需要 frame 的位置；不硬编码偏移
+    targets = sorted({t for insn in instructions for t in insn.jumps})
+    entries: list[bytes] = []
+    prev = None
+    for off in targets:
+        if prev is None:
+            delta = off
+            entries.append(bytes([0xFD]) + struct.pack(">H", delta) + object_info + int_info)
+        else:
+            delta = off - prev - 1  # 规范：非首帧 offset = prev + delta + 1
+            if delta <= 63:
+                entries.append(bytes([delta]))  # SAME
+            else:
+                entries.append(bytes([251]) + struct.pack(">H", delta))  # SAME_EXTENDED
+        prev = off
+    payload = struct.pack(">H", len(entries)) + b"".join(entries)
+    return Attribute(cp.add_utf8("StackMapTable"), payload)
+
+
 def _build_decrypt_helper(class_file: ClassFile, seed: int) -> MethodInfo:
     """构造静态解密方法：static String d_xxx(String s)。
 
     实现：把 s 的每个 char 与 key 异或后组装为新 String 返回。
+    class 版本 >= 51 时附带 StackMapTable（split verification 要求）。
     """
     cp = class_file.cp
     name = cp.add_utf8("_u" + format(seed, "x"))
@@ -87,16 +125,21 @@ def _build_decrypt_helper(class_file: ClassFile, seed: int) -> MethodInfo:
     key = _key_for(seed)
     code_utf = cp.add_utf8("Code")
     code_bytes = bytes([
-        0x2A, 0xB6, length_mref >> 8, length_mref & 0xFF, 0xBC, 0x07,   # buf=new char[s.length()]
+        0x2A, 0xB6, length_mref >> 8, length_mref & 0xFF, 0xBC, 0x05,   # buf=new char[s.length()]（atype 5=char）
         0x4C, 0x03, 0x3D,                                              # buf, i=0
-        0x1C, 0x2B, 0xBE, 0xA2, 0x00, 0x15,                            # while(i<buf.length)
+        0x1C, 0x2B, 0xBE, 0xA2, 0x00, 0x16,                            # while(i<buf.length)
         0x2B, 0x1C, 0x2A, 0x1C,                                        # buf[i]=s.charAt(i)
-        0xB6, charat_mref >> 8, charat_mref & 0xFF, 0x10, key,         #   ^ key
-        0x82, 0x92, 0x55, 0x84, 0x02, 0x01, 0xA7, 0xFF, 0xEB,          #   ; i++
+        0xB6, charat_mref >> 8, charat_mref & 0xFF, 0x11, 0x00, key,   #   ^ key（sipush 无符号，避免 bipush 符号扩展）
+        0x82, 0x92, 0x55, 0x84, 0x02, 0x01, 0xA7, 0xFF, 0xEA,          #   ; i++
         0xBB, str_class >> 8, str_class & 0xFF, 0x59, 0x2B,            # new String(buf)
         0xB7, init_mref >> 8, init_mref & 0xFF, 0xB0,                  # <init>; return
     ])
-    helper_code = CodeAttribute(4, 3, parse_code(code_bytes), [], [], code_utf)
+    instructions = parse_code(code_bytes)
+    code_attrs: list[Attribute] = []
+    if class_file.major_version >= 51:
+        char_arr_class = cp.add(CONSTANT_Class, cp.add_utf8("[C"))
+        code_attrs.append(_build_stack_map_table(class_file, char_arr_class, instructions))
+    helper_code = CodeAttribute(4, 3, instructions, [], code_attrs, code_utf)
     return MethodInfo(0x000A, name, desc, [helper_code])
 
 
@@ -143,8 +186,10 @@ def encrypt_strings(class_file: ClassFile, seed: int) -> None:
             if insn.opcode in (0x12, 0x13):  # ldc / ldc_w
                 idx = int.from_bytes(insn.operand, "big")
                 if idx in encryptable:
-                    new_insns.append(Instruction(0x13, struct.pack(">H", encryptable[idx])))
-                    new_insns.append(Instruction(0xB8, struct.pack(">H", helper_mref)))
+                    # old_offset=-1：占位哨兵，避免与原始指令（偏移>=0）在
+                    # offset_mapping 中冲突，保证跳转/StackMapTable 重定位正确
+                    new_insns.append(Instruction(0x13, struct.pack(">H", encryptable[idx]), old_offset=-1))
+                    new_insns.append(Instruction(0xB8, struct.pack(">H", helper_mref), old_offset=-1))
                     continue
             new_insns.append(insn)
         code.instructions = new_insns

@@ -148,6 +148,106 @@ def nearest_new_offset(mapping: dict[int, int], old: int) -> int:
     return mapping[max(candidates)]
 
 
+def _vt_len(buf: memoryview, pos: int) -> int:
+    """verification_type_info 长度：Object(7)/Uninitialized(8) 3 字节，其余 1 字节。"""
+    return 3 if buf[pos] in (7, 8) else 1
+
+
+def remap_stack_map_table(payload: bytes, mapping: dict[int, int]) -> bytes:
+    """重定位 StackMapTable 各帧的偏移（旧偏移 -> 新偏移，JVMS 4.7.4）。
+
+    在指令流插入/删除后调用。帧的验证类型信息不变（插入的 ldc_w +
+    invokestatic 栈效果为零，不改变分支目标处 locals），只需按新布局
+    重新编码各帧 offset_delta：
+      首帧 offset = offset_delta；
+      后续帧 offset = 上一帧 offset + offset_delta + 1。
+    偏移无变化（identity mapping）时输出与输入逐字节一致。
+    """
+    def new_of(old: int) -> int:
+        return mapping.get(old, nearest_new_offset(mapping, old))
+
+    def skip_types(pos: int, count: int) -> int:
+        for _ in range(count):
+            pos += _vt_len(buf, pos)
+        return pos
+
+    buf = memoryview(payload)
+    (count,) = struct.unpack_from(">H", buf, 0)
+    pos = 2
+    out = bytearray(struct.pack(">H", count))
+    old_prev = None  # 上一帧绝对偏移（旧布局）
+    new_prev = None  # 上一帧绝对偏移（新布局）
+    for _ in range(count):
+        ft = buf[pos]
+        pos += 1
+        if ft <= 63:  # SAME：delta 编码在 frame_type
+            delta, ntypes = ft, 0
+        elif ft <= 127:  # SAME_LOCALS_1_STACK_ITEM
+            delta, ntypes = ft - 64, 1
+        elif ft == 247:  # SAME_LOCALS_1_STACK_ITEM_EXTENDED
+            delta = struct.unpack_from(">H", buf, pos)[0]
+            pos += 2
+            ntypes = 1
+        elif 248 <= ft <= 250:  # CHOP
+            delta = struct.unpack_from(">H", buf, pos)[0]
+            pos += 2
+            ntypes = 0
+        elif ft == 251:  # SAME_EXTENDED
+            delta = struct.unpack_from(">H", buf, pos)[0]
+            pos += 2
+            ntypes = 0
+        elif 252 <= ft <= 254:  # APPEND
+            delta = struct.unpack_from(">H", buf, pos)[0]
+            pos += 2
+            ntypes = ft - 251
+        elif ft == 255:  # FULL：u2 delta, u2 nlocals, locals, u2 nstack, stack
+            delta = struct.unpack_from(">H", buf, pos)[0]
+            pos += 2
+            nlocals = struct.unpack_from(">H", buf, pos)[0]
+            pos += 2
+            lstart = pos
+            pos = skip_types(pos, nlocals)
+            local_types = bytes(buf[lstart:pos])
+            nstack = struct.unpack_from(">H", buf, pos)[0]
+            pos += 2
+            sstart = pos
+            pos = skip_types(pos, nstack)
+            stack_types = bytes(buf[sstart:pos])
+            ntypes = 0  # FULL 的 types 已单独捕获
+        else:
+            raise ValueError(f"无效的 StackMapTable frame_type: {ft}")
+        if ft != 255:
+            tstart = pos
+            pos = skip_types(pos, ntypes)
+            types_blob = bytes(buf[tstart:pos])
+
+        old_abs = delta if old_prev is None else old_prev + delta + 1
+        old_prev = old_abs
+        new_abs = new_of(old_abs)
+        nd = new_abs if new_prev is None else new_abs - new_prev - 1
+        new_prev = new_abs
+
+        if ft <= 63:  # SAME
+            out += bytes([nd]) if nd <= 63 else b"\xfb" + struct.pack(">H", nd)
+        elif ft <= 127:  # SAME_LOCALS_1_STACK_ITEM
+            if nd <= 63:
+                out += bytes([64 + nd]) + types_blob
+            else:
+                out += b"\xf7" + struct.pack(">H", nd) + types_blob
+        elif ft == 247:
+            out += b"\xf7" + struct.pack(">H", nd) + types_blob
+        elif 248 <= ft <= 250:  # CHOP
+            out += bytes([ft]) + struct.pack(">H", nd)
+        elif ft == 251:  # SAME_EXTENDED
+            out += b"\xfb" + struct.pack(">H", nd)
+        elif 252 <= ft <= 254:  # APPEND
+            out += bytes([ft]) + struct.pack(">H", nd) + types_blob
+        else:  # FULL
+            out += (b"\xff" + struct.pack(">H", nd) + struct.pack(">H", nlocals)
+                    + local_types + struct.pack(">H", nstack) + stack_types)
+    return bytes(out)
+
+
 def serialize_instructions(insns: list[Instruction]) -> bytes:
     """按新布局序列化指令流（重写所有跳转偏移）。"""
     layout(insns)

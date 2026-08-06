@@ -2,6 +2,7 @@
 """GUI（Flet）逻辑测试：不启动窗口，验证参数构造与配置填充。"""
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -80,7 +81,7 @@ def test_load_config_fills_form(app, tmp_path):
         "seed": 7, "rename": False,
     }), encoding="utf-8")
     app.config_field.value = str(conf)
-    app._on_load_config(None)
+    asyncio.run(app._on_load_config(None))
     assert app.input_field.value == "src"
     assert app.output_field.value == "out"
     assert app.seed_field.value == "7"

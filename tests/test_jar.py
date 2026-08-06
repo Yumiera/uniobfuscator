@@ -105,6 +105,102 @@ def test_encrypt_strings():
     assert out.cp.utf8(out.cp[str_idx][1]) == "".join(chr(ord(c) ^ 0xA2) for c in "hello")
 
 
+def test_helper_stack_map_table():
+    """解密 helper（含循环）必须带 StackMapTable（major>=51 的 SplitVerifier 要求）。"""
+    cf = parse_class_file(build_class(with_debug=False))
+    assert cf.major_version >= 51
+    encrypt_strings(cf, seed=5)
+    helper = [m for m in cf.methods if cf.cp.utf8(m.name_index) == "_u5"][0]
+    code = helper.code()
+    smt = [a for a in code.attributes if cf.cp.utf8(a.name_index) == "StackMapTable"]
+    assert smt, "含分支的 helper 必须携带 StackMapTable，否则 JVM 抛 VerifyError"
+    payload = smt[0].payload
+    assert int.from_bytes(payload[:2], "big") == 2  # 2 个 frame
+    # entry1: APPEND(2) frame（251+2=253），delta=9（循环头，goto 目标）：Object("[C") + Integer
+    # 规范：首帧 offset = offset_delta
+    assert payload[2] == 0xFD
+    assert int.from_bytes(payload[3:5], "big") == 9
+    assert payload[5] == 7 and payload[8] == 1
+    # entry2: SAME frame（frame_type=24）：offset = 9 + 24 + 1 = 34（循环退出，if_icmpge 目标）
+    assert payload[9] == 24
+    # round-trip 后 StackMapTable 仍存在且内容一致
+    out = parse_class_file(cf.serialize())
+    helper2 = [m for m in out.methods if out.cp.utf8(m.name_index) == "_u5"][0]
+    smt2 = [a for a in helper2.code().attributes
+            if out.cp.utf8(a.name_index) == "StackMapTable"]
+    assert smt2 and smt2[0].payload == payload
+
+
+def test_stack_map_table_remap():
+    """SMT 帧偏移重定位：delta+1 规则；identity 映射时逐字节一致。"""
+    from uniobfuscator.jvm.code import remap_stack_map_table
+    # javac 风格：APPEND(2) @9（Object "[C" idx 0x2B + Integer），SAME @33（delta=23）
+    payload = struct.pack(">H", 2) + bytes([
+        0xFD, 0x00, 0x09, 0x07, 0x00, 0x2B, 0x01,
+        0x17,
+    ])
+    assert remap_stack_map_table(payload, {9: 9, 33: 33}) == payload
+    # 指令前插 5 字节：9->14, 33->38；第二帧 delta = 38 - 14 - 1 = 23
+    out = remap_stack_map_table(payload, {9: 14, 33: 38})
+    assert out[:2] == struct.pack(">H", 2)
+    assert out[2] == 0xFD
+    assert int.from_bytes(out[3:5], "big") == 14
+    assert out[5:8] == bytes([0x07, 0x00, 0x2B]) and out[8] == 0x01
+    assert out[9] == 0x17  # SAME（frame_type 23，delta 编码在 frame_type）
+
+
+def test_encrypt_loop_method_remaps_smt():
+    """带循环+字符串的方法被加密后，其 StackMapTable 帧偏移随重定位更新。
+
+    原方法：ldc "hello"@0; astore_1; iconst_0; istore_2;
+            iload_2@5(循环头); bipush 10; if_icmpge 14; iinc 2,1;
+            aload_1@14(循环出口); areturn
+    SMT：APPEND(2)@5（Object String + Integer）、SAME@14。
+    加密后 ldc -> ldc_w+invokestatic（+5 字节）：循环头 -> 9，出口 -> 18。
+    """
+    cp = ConstantPool()
+    hello = cp.add_utf8("hello")
+    strc = cp.add(CONSTANT_String, hello)          # index 2，ldc 操作数
+    this = cp.add(CONSTANT_Class, cp.add_utf8("T"))
+    superc = cp.add(CONSTANT_Class, cp.add_utf8("java/lang/Object"))
+    fname = cp.add_utf8("f")
+    fdesc = cp.add_utf8("(Ljava/lang/String;)V")
+    code_utf = cp.add_utf8("Code")
+    smt_utf = cp.add_utf8("StackMapTable")
+    str_class = cp.add(CONSTANT_Class, cp.add_utf8("java/lang/String"))
+    code_bytes = bytes([
+        0x12, strc,               # ldc "hello"
+        0x4C,                     # astore_1
+        0x03, 0x3D,               # iconst_0; istore_2
+        0x1C, 0x10, 0x0A,         # iload_2; bipush 10
+        0xA2, 0x00, 0x06,         # if_icmpge 13
+        0x84, 0x02, 0x01,         # iinc 2, 1
+        0x2B, 0xB0,               # aload_1; areturn
+    ])
+    object_info = bytes([7]) + struct.pack(">H", str_class)
+    int_info = bytes([1])
+    smt = (struct.pack(">H", 2)
+           + bytes([0xFD]) + struct.pack(">H", 5) + object_info + int_info
+           + bytes([8]))  # SAME @14（delta = 14 - 5 - 1 = 8）
+    code = CodeAttribute(2, 3, parse_code(code_bytes), [],
+                         [Attribute(smt_utf, smt)], code_utf)
+    cf = ClassFile(cp, 0x0021, this, superc, [], [],
+                   [MethodInfo(0x0009, fname, fdesc, [code])], [])
+
+    encrypt_strings(cf, seed=5)
+    out = parse_class_file(cf.serialize())
+    f = [m for m in out.methods if out.cp.utf8(m.name_index) == "f"][0]
+    smt2 = [a for a in f.code().attributes
+            if out.cp.utf8(a.name_index) == "StackMapTable"][0]
+    p = smt2.payload
+    assert p[:2] == struct.pack(">H", 2)
+    assert p[2] == 0xFD and int.from_bytes(p[3:5], "big") == 9   # APPEND(2) @9
+    assert p[5] == 7 and p[8] == 1
+    assert p[9] == 8                                            # SAME @18（18-9-1=8）
+    # 二次序列化（identity 映射）逐字节一致
+    assert parse_class_file(out.serialize()).serialize() == out.serialize()
+
+
 def test_encrypt_strings_skips_non_ascii_control():
     """密文含 NUL 的字符串应跳过加密（保持明文）。"""
     cp = ConstantPool()

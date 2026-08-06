@@ -29,6 +29,16 @@ class LanguageAdapter(ABC):
     display_name: str = ""
     extensions: tuple[str, ...] = ()
 
+    #: 该语言支持的文本混淆特性及出厂默认开关。
+    #: key 与 CLI/配置文件中的 pass 名一致（rename/strings/dead_code/arithmetic）。
+    #: 子类可覆盖以裁剪能力或调整默认值（例如某些语言重命名风险高默认关闭）。
+    features: dict[str, bool] = {
+        "rename": True,
+        "strings": True,
+        "dead_code": True,
+        "arithmetic": True,
+    }
+
     def __init__(self):
         self._language = Language(self.language_func())
         self._parser = Parser(self._language)

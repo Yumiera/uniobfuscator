@@ -47,6 +47,8 @@ DEFAULT_CONFIG_FILE = "uniobfuscator.toml"
 GLOBAL_KEYS = frozenset({
     "path", "language", "output", "seed", "stdout",
     "rename", "strings", "dead_code", "arithmetic", "languages",
+    "exclude",
+    "java_arithmetic", "java_dead_code", "java_scramble", "java_rename",
 })
 
 #: 按语言分组里允许出现的字段
@@ -61,7 +63,11 @@ DEFAULT_CONFIG_TEMPLATE = """\
 # 修改本文件后，运行 uniobfuscator 时自动生效。
 # 也可用 -c <其它配置> 指定其它配置文件（命令行参数优先于配置文件）。
 #
-# 优先级：命令行参数 > 按语言配置 > 全局配置 > 内置默认值。
+# 优先级：命令行参数 > 按语言配置 > 全局配置 > 语言能力默认值。
+# 混淆开关按输入形态自动切换：
+#   .py/.js/.java 源文件  -> 下方 rename/strings/dead_code/arithmetic
+#   .jar 字节码           -> 下方 strings（共享）+ java_* 系列
+# 传了不适用的开关会在 stderr 提示并忽略。
 # 注意：相对路径基于命令行工作目录解析，建议写绝对路径。
 
 # ---------------- 全局配置（作用于整个程序） ----------------
@@ -71,23 +77,34 @@ DEFAULT_CONFIG_TEMPLATE = """\
 # stdout = false            # 单文件结果输出到屏幕而非写文件
 # seed = 0                  # 随机种子，保证可复现
 
-# 混淆开关（默认全部开启，设为 false 可关闭）
-rename = true               # 标识符重命名
-strings = true              # 字符串加密
+# 文本源码混淆开关（.py / .js / .java 源文件；默认全部开启，设为 false 可关闭）
+rename = true               # 标识符重命名（函数内局部变量/参数）
+strings = true              # 字符串加密（JAR 模式同样适用）
 dead_code = true            # 死代码注入
 arithmetic = true           # 算术混淆
 
-# ---------------- 按语言配置（覆盖对应语言的全局开关） ----------------
-# 每个语言段可单独设置：seed / rename / strings / dead_code / arithmetic
+# JAR 模式排除列表（不混淆的类/包，原样保留；用于反射加载、资源路径等类）
+# 格式：精确类名 'com.foo.Secret' 或包前缀 'com.foo.secret.*'（含子包）
+# exclude = ["com.foo.Secret", "com.foo.secret.*"]
+
+# JAR 字节码混淆开关（.jar；默认除类名重命名外全部开启）
+# java_arithmetic = true    # 整型常量算术混淆
+# java_dead_code = true     # 死代码注入（不透明谓词，仅无分支方法）
+# java_scramble = true      # 控制流打散（栈平衡垃圾块 + goto 绕行）
+# java_rename = false       # 类名重命名（改常量池引用；反射/框架需配合 exclude）
+
+# ---------------- 按语言配置（覆盖对应语言的全局默认） ----------------
+# 每个语言段可单独设置：seed / rename / strings / dead_code / arithmetic。
+# 即"同一种输入，不同语言可用不同开关组合"。
 #
 # [languages.python]
-# rename = false            # Python 文件不重命名
+# rename = false            # Python 不重命名
 #
 # [languages.javascript]
 # seed = 42
 #
 # [languages.java]
-# dead_code = false
+# dead_code = false         # Java 源文件不注入死代码
 """
 
 

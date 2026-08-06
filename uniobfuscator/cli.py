@@ -1,6 +1,17 @@
 # -*- coding: utf-8 -*-
 """uniobfuscator 命令行入口。
 
+混淆开关按输入形态自动切换（同一份命令行/配置对多语言通用）：
+
+- 文本源文件（.py/.js/.java）：
+    --rename / --strings / --dead-code / --arithmetic
+    各语言可裁剪能力或调整默认值（见 languages 配置段）；
+    传了 JAR 专属的 --java-* 开关会提示"仅适用于 JAR 字节码模式"并忽略。
+- JAR 字节码（.jar）：
+    --strings（共享，字符串加密）
+    --java-arithmetic / --java-dead-code / --java-scramble / --java-rename
+    传了文本专属的 --rename/--dead-code/--arithmetic 会提示并忽略。
+
 用法示例：
   uniobfuscator app.py -o app_obf.py            # 单文件
   uniobfuscator app.js --no-rename --stdout     # 单文件输出到标准输出
@@ -8,7 +19,10 @@
   uniobfuscator src/ -o out/ -l java            # 只混淆 Java 文件
   uniobfuscator -c conf.json                    # 全部参数由配置文件提供
   uniobfuscator -c conf.json src/ --seed 9      # 配置文件 + 命令行覆盖（命令行优先）
-  uniobfuscator app.jar -o app_obf.jar          # JAR 字节码混淆（调试移除 + 字符串加密）
+  uniobfuscator app.jar -o app_obf.jar          # JAR 字节码混淆
+  uniobfuscator app.jar --java-rename -o app_obf.jar   # 开启类名重命名（需配合 --exclude）
+  uniobfuscator app.jar --exclude com.foo.Secret --exclude com.foo.secret.* -o app_obf.jar
+                                               # 排除指定类/包（原样保留，适合反射/资源类）
 """
 from __future__ import annotations
 
@@ -26,7 +40,7 @@ try:  # 以模块方式运行（python -m uniobfuscator.cli）
         split_config,
     )
     from .core.pipeline import DEFAULT_OPTIONS, obfuscate, obfuscate_file
-    from .jvm import is_jar_file, obfuscate_jar
+    from .jvm import JAR_FEATURES, is_jar_file, obfuscate_jar
     from .languages import (
         SUPPORTED_EXTENSIONS,
         adapter_for_filename,
@@ -44,7 +58,7 @@ except ImportError:  # 直接运行脚本（python uniobfuscator/cli.py）时的
         split_config,
     )
     from uniobfuscator.core.pipeline import DEFAULT_OPTIONS, obfuscate, obfuscate_file
-    from uniobfuscator.jvm import is_jar_file, obfuscate_jar
+    from uniobfuscator.jvm import JAR_FEATURES, is_jar_file, obfuscate_jar
     from uniobfuscator.languages import (
         SUPPORTED_EXTENSIONS,
         adapter_for_filename,
@@ -58,6 +72,13 @@ LANG_CHOICES = list(LANGUAGES)
 BINARY_ARTIFACT_EXTS = frozenset({
     ".jar", ".class", ".pyc", ".pyo", ".o", ".so", ".pyd", ".dll", ".dylib", ".exe",
 })
+
+#: 文本语言专属开关（JAR 模式不适用；strings 为两种形态共享）
+TEXT_ONLY_KEYS = frozenset({"rename", "dead_code", "arithmetic"})
+#: JAR 字节码专属开关（文本模式不适用）
+JAR_ONLY_KEYS = frozenset(
+    {"java_arithmetic", "java_dead_code", "java_scramble", "java_rename"}
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -80,13 +101,29 @@ def _build_parser() -> argparse.ArgumentParser:
         help="随机种子，保证可复现（默认 0）",
     )
     p.add_argument(
+        "--exclude", action="append", metavar="CLASS", default=None,
+        help="JAR 模式下跳过混淆的类/包（可重复；如 com.foo.Secret 或 com.foo.*）",
+    )
+    for flag, default, desc in (
+        ("java-arithmetic", True, "JAR 模式整型常量算术混淆"),
+        ("java-dead-code", True, "JAR 模式死代码注入（不透明谓词）"),
+        ("java-scramble", True, "JAR 模式控制流打散"),
+        ("java-rename", False, "JAR 模式类名重命名（破坏性最强，需配合 --exclude）"),
+    ):
+        p.add_argument(
+            f"--{flag}", dest=flag.replace("-", "_"),
+            action=argparse.BooleanOptionalAction, default=None,
+            help=desc + f"（默认{'开启' if default else '关闭'}）",
+        )
+    p.add_argument(
         "-c", "--config",
         help="配置文件路径（.json / .toml），命令行参数优先于配置文件",
     )
-    for flag in ("rename", "strings", "dead_code", "arithmetic"):
+    for flag in ("rename", "strings", "dead-code", "arithmetic"):
         p.add_argument(
-            f"--{flag}", action=argparse.BooleanOptionalAction, default=None,
-            help=f"启用{flag}混淆（默认开启；用 --no-{flag} 关闭）",
+            f"--{flag}", dest=flag.replace("-", "_"),
+            action=argparse.BooleanOptionalAction, default=None,
+            help=f"启用{flag.replace('-', '_')}混淆（默认开启；用 --no-{flag} 关闭）",
         )
     p.add_argument("--list-languages", action="store_true", help="列出支持的语言")
     return p
@@ -97,24 +134,53 @@ def _build_options(
     global_cfg: dict | None = None,
     per_language: dict | None = None,
     lang_name: str | None = None,
+    features: dict[str, bool] | None = None,
 ) -> dict:
     """把解析结果转成流水线 options。
 
-    优先级：命令行显式参数 > 按语言配置 > 全局配置 > 内置默认值。
-    布尔开关与 seed 的 default=None 表示“命令行未指定”，
-    此时回落到按语言配置 -> 全局配置 -> 内置默认值。
+    优先级：命令行显式参数 > 按语言配置 > 全局配置 > 语言能力默认 > 内置默认值。
+    features 为目标语言/形态的混淆特性出厂默认（adapter.features 或 JAR_FEATURES）；
+    布尔开关与 seed 的 default=None 表示"命令行未指定"，
+    此时回落到按语言配置 -> 全局配置 -> 语言能力默认 -> 内置默认值。
     """
     options = dict(DEFAULT_OPTIONS)  # 内置默认
-    for key in ("seed", "rename", "strings", "dead_code", "arithmetic"):
+    if features:
+        options.update(features)  # 语言/形态出厂默认（覆盖内置默认）
+    for key in ("seed", "rename", "strings", "dead_code", "arithmetic", "exclude",
+                "java_arithmetic", "java_dead_code", "java_scramble", "java_rename"):
         if key in (global_cfg or {}):
             options[key] = global_cfg[key]  # 全局配置
     if per_language and lang_name:
         options.update(per_language.get(lang_name, {}))  # 按语言配置
-    for key in ("seed", "rename", "strings", "dead_code", "arithmetic"):
+    for key in ("seed", "rename", "strings", "dead_code", "arithmetic", "exclude",
+                "java_arithmetic", "java_dead_code", "java_scramble", "java_rename"):
         value = getattr(args, key)
         if value is not None:
             options[key] = value  # 命令行显式参数
     return options
+
+
+def _warn_inapplicable(
+    args: argparse.Namespace,
+    active_keys: frozenset[str],
+    warned: set[str] | None = None,
+) -> None:
+    """用户显式传了不属于当前模式开关集合的开关时，警告并忽略。
+
+    active_keys 为当前模式（文本语言 or JAR 字节码）支持的键集合；
+    strings 为两种形态共享，不在提示范围。warned 用于目录模式
+    （多语言文件循环）下对同一开关只提示一次。
+    """
+    for key in TEXT_ONLY_KEYS | JAR_ONLY_KEYS:
+        value = getattr(args, key, None)
+        if key not in active_keys and value is not None:
+            if warned is not None and key in warned:
+                continue
+            mode = "文本源码混淆" if key in TEXT_ONLY_KEYS else "JAR 字节码模式"
+            flag = "--" + key.replace("_", "-")
+            print(f"警告: {flag} 仅适用于 {mode}，已忽略", file=sys.stderr)
+            if warned is not None:
+                warned.add(key)
 
 
 def _apply_config(parser: argparse.ArgumentParser, global_cfg: dict) -> None:
@@ -166,21 +232,22 @@ def _obfuscate_jar_file(
     if args.stdout:
         print("错误: --stdout 不适用于 JAR 文件", file=sys.stderr)
         return 2
-    # jar 是字节码模式：只应用 seed 与字符串加密开关（无语言级配置）
-    options = _build_options(args, global_cfg, per_language, lang_name=None)
-    if options.get("rename") is False or options.get("dead_code") is False \
-            or options.get("arithmetic") is False:
-        print(
-            "注意: JAR 字节码模式只做调试信息移除 + 字符串加密，"
-            "--no-rename/--no-dead-code/--no-arithmetic 不适用（已忽略）",
-            file=sys.stderr,
-        )
+    # JAR 是字节码模式：文本语言的 rename/dead_code/arithmetic 开关不适用，
+    # 自动切换到 java_* 系列（strings 为两种形态共享）
+    options = _build_options(args, global_cfg, per_language,
+                             lang_name=None, features=JAR_FEATURES)
+    _warn_inapplicable(args, frozenset(JAR_FEATURES))
     out_path = args.output or f"{os.path.splitext(args.path)[0]}.obf.jar"
     try:
         stats = obfuscate_jar(
             args.path, out_path,
             seed=int(options.get("seed", 0)),
             strings=bool(options.get("strings", True)),
+            exclude=options.get("exclude"),
+            arithmetic=bool(options.get("java_arithmetic", True)),
+            dead_code=bool(options.get("java_dead_code", True)),
+            scramble=bool(options.get("java_scramble", True)),
+            rename=bool(options.get("java_rename", False)),
         )
     except (OSError, ValueError) as e:
         print(f"错误: JAR 混淆失败: {e}", file=sys.stderr)
@@ -189,7 +256,10 @@ def _obfuscate_jar_file(
         print(f"警告: {warning}", file=sys.stderr)
     print(
         f"JAR 混淆完成: {args.path} -> {out_path} "
-        f"（处理 {stats['class']} 个 class，跳过 {stats['skipped']} 个）"
+        f"（处理 {stats['class']} 个 class，跳过 {stats['skipped']} 个，"
+        f"排除 {stats['excluded']} 个，重命名 {stats['renamed']} 个；"
+        f"算术 {stats['arithmetic']} / 死代码 {stats['dead_code']} / "
+        f"打散 {stats['scramble']}）"
     )
     return 0
 
@@ -208,7 +278,9 @@ def _obfuscate_single_file(
     except KeyError as e:
         print(f"错误: {e}", file=sys.stderr)
         return 2
-    options = _build_options(args, global_cfg, per_language, adapter.name)
+    options = _build_options(args, global_cfg, per_language,
+                             adapter.name, features=adapter.features)
+    _warn_inapplicable(args, frozenset(adapter.features))
 
     try:
         with open(args.path, encoding="utf-8") as f:
@@ -267,6 +339,7 @@ def _obfuscate_directory(
         )
 
     count, failed = 0, 0
+    warned: set[str] = set()  # 目录模式：同一不适用开关只提示一次
     for src in files:
         rel = os.path.relpath(src, in_root)
         dst = os.path.join(out_root, rel)
@@ -275,7 +348,9 @@ def _obfuscate_directory(
                 get_adapter(args.language) if args.language
                 else adapter_for_filename(src)
             )
-            options = _build_options(args, global_cfg, per_language, adapter.name)
+            options = _build_options(args, global_cfg, per_language,
+                                     adapter.name, features=adapter.features)
+            _warn_inapplicable(args, frozenset(adapter.features), warned)
             obfuscate_file(src, dst, adapter, options)
             print(f"  混淆: {rel} ({adapter.display_name})")
             count += 1

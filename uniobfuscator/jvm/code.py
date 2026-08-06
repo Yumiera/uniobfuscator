@@ -306,3 +306,161 @@ def parse_code_attr(name_index: int, payload: bytes) -> CodeAttribute:
         pos += a_len
     return CodeAttribute(max_stack, max_locals, instructions, exc_table,
                          attributes, name_index)
+
+
+# ---------------------------------------------------------------------------
+# 栈效果分析（供控制流打散等 pass 使用）
+# ---------------------------------------------------------------------------
+
+#: 指令对栈深度的净效果（槽数）。仅覆盖无操作数的固定效果指令；
+#: invoke*（按方法描述符）、wide（按内层指令）、multianewarray 另行计算。
+_STACK_EFFECT = {
+    # 常量
+    0x01: 1, 0x02: 1, 0x03: 1, 0x04: 1, 0x05: 1, 0x06: 1, 0x07: 1, 0x08: 1,
+    0x09: 2, 0x0A: 2, 0x0B: 1, 0x0C: 1, 0x0D: 1, 0x0E: 2, 0x0F: 2,
+    0x10: 1, 0x11: 1, 0x12: 1, 0x13: 1, 0x14: 2,
+    # 局部变量加载（long/double 占两槽）
+    0x15: 1, 0x16: 2, 0x17: 1, 0x18: 2, 0x19: 1,
+    0x1A: 1, 0x1B: 1, 0x1C: 1, 0x1D: 1,
+    0x1E: 2, 0x1F: 2, 0x20: 2, 0x21: 2,
+    0x22: 1, 0x23: 1, 0x24: 1, 0x25: 1,
+    0x26: 2, 0x27: 2, 0x28: 2, 0x29: 2,
+    0x2A: 1, 0x2B: 1, 0x2C: 1, 0x2D: 1,
+    # 数组加载：pop 2 push 1
+    0x2E: -1, 0x2F: -1, 0x30: -1, 0x31: -1, 0x32: -1, 0x33: -1, 0x34: -1, 0x35: -1,
+    # 局部变量存储
+    0x36: -1, 0x37: -2, 0x38: -1, 0x39: -2, 0x3A: -1,
+    0x3B: -1, 0x3C: -1, 0x3D: -1, 0x3E: -1,
+    0x3F: -2, 0x40: -2, 0x41: -2, 0x42: -2,
+    0x43: -1, 0x44: -1, 0x45: -1, 0x46: -1,
+    0x47: -2, 0x48: -2, 0x49: -2, 0x4A: -2,
+    0x4B: -1, 0x4C: -1, 0x4D: -1, 0x4E: -1,
+    # 数组存储
+    0x4F: -3, 0x50: -4, 0x51: -3, 0x52: -4, 0x53: -3, 0x54: -3, 0x55: -3, 0x56: -3,
+    # 栈操作
+    0x57: -1, 0x58: -2, 0x59: 1, 0x5A: 1, 0x5B: 1, 0x5C: 2, 0x5D: 2, 0x5E: 2, 0x5F: 0,
+    # 算术
+    0x60: -1, 0x61: -2, 0x62: -1, 0x63: -2,
+    0x64: -1, 0x65: -2, 0x66: -1, 0x67: -2,
+    0x68: -1, 0x69: -2, 0x6A: -1, 0x6B: -2,
+    0x6C: -1, 0x6D: -2, 0x6E: -1, 0x6F: -2,
+    0x70: -1, 0x71: -2, 0x72: -1, 0x73: -2,
+    0x74: 0, 0x75: 0, 0x76: 0, 0x77: 0,
+    0x78: -1, 0x79: 0, 0x7A: -1, 0x7B: 0, 0x7C: -1, 0x7D: 0,
+    0x7E: -1, 0x7F: -2, 0x80: -1, 0x81: -2, 0x82: -1, 0x83: -2,
+    0x84: 0,  # iinc
+    # 类型转换
+    0x85: 1, 0x86: 0, 0x87: 1, 0x88: -1, 0x89: -1, 0x8A: 0,
+    0x8B: 0, 0x8C: 1, 0x8D: 1, 0x8E: -1, 0x8F: 0, 0x90: -1,
+    0x91: 0, 0x92: 0, 0x93: 0,
+    # 比较
+    0x94: -3, 0x95: -1, 0x96: -1, 0x97: -3, 0x98: -3,
+    # 条件跳转 / 无条件跳转
+    0x99: -1, 0x9A: -1, 0x9B: -1, 0x9C: -1, 0x9D: -1, 0x9E: -1,
+    0x9F: -2, 0xA0: -2, 0xA1: -2, 0xA2: -2, 0xA3: -2, 0xA4: -2, 0xA5: -2, 0xA6: -2,
+    0xA7: 0, 0xA8: 1, 0xA9: 0,
+    0xAA: -1, 0xAB: -1,
+    # 返回 / 异常
+    0xAC: -1, 0xAD: -2, 0xAE: -1, 0xAF: -2, 0xB0: -1, 0xB1: 0,
+    0xBF: -1,
+    # 字段
+    0xB2: 1, 0xB3: -1, 0xB4: 0, 0xB5: -2,
+    # 对象/数组
+    0xBB: 1, 0xBC: 0, 0xBD: 0, 0xBE: 0, 0xC0: 0, 0xC1: 0,
+    0xC2: -1, 0xC3: -1,
+    # 其它跳转
+    0xC6: -1, 0xC7: -1, 0xC8: 0, 0xC9: 1,
+}
+
+#: 会写入局部变量的指令（打散这类方法的控制流会破坏 SAME 帧）
+_WRITE_LOCAL = frozenset(range(0x36, 0x4F)) | {0x84, 0xA9}
+
+
+def _descriptor_effect(desc: str) -> tuple[int, int]:
+    """方法描述符的 (参数槽数, 返回值槽数)。long/double 占 2 槽。"""
+    pop, i = 0, 1  # 跳过 '('
+    while i < len(desc) and desc[i] != ")":
+        c = desc[i]
+        if c in ("J", "D"):
+            pop += 2
+            i += 1
+        elif c == "L":
+            j = desc.index(";", i)
+            pop += 1
+            i = j + 1
+        elif c == "[":
+            while desc[i] == "[":
+                i += 1
+            if desc[i] in ("J", "D"):
+                pop += 2
+            else:
+                pop += 1
+            if desc[i] == "L":
+                i = desc.index(";", i) + 1
+            else:
+                i += 1
+        else:
+            pop += 1
+            i += 1
+    ret = desc[i + 1:] if i < len(desc) else ""
+    if ret == "V":
+        push = 0
+    elif ret and ret[0] in ("J", "D"):
+        push = 2
+    else:
+        push = 1
+    return pop, push
+
+
+def _stack_effect(insn: Instruction, cp) -> int:
+    """单条指令对栈深度的净效果（槽数）。invoke 按常量池方法描述符计算。"""
+    op = insn.opcode
+    if op in (0xB6, 0xB7, 0xB9):  # invokevirtual/special/interface：参数 + this
+        return _invoke_effect(insn, cp) - 1
+    if op in (0xB8, 0xBA):  # invokestatic / invokedynamic
+        return _invoke_effect(insn, cp)
+    if op == 0xC4:  # wide：效果与内层指令相同
+        sub = insn.operand[0]
+        if sub == 0x84:
+            return 0
+        return _STACK_EFFECT.get(sub, 0)
+    if op == 0xC5:  # multianewarray：pop dims push 1
+        return 1 - insn.operand[2]
+    return _STACK_EFFECT.get(op, 0)
+
+
+def _invoke_effect(insn: Instruction, cp) -> int:
+    """invoke* 的 (返回槽 - 参数槽)。"""
+    idx = int.from_bytes(insn.operand, "big")
+    ref = cp[idx]
+    if ref is None:
+        return 0
+    nat_idx = ref[2]
+    nat = cp[nat_idx]
+    if nat is None or nat[0] != 12:  # CONSTANT_NameAndType
+        return 0
+    desc = cp.utf8(nat[2])
+    pop, push = _descriptor_effect(desc)
+    return push - pop
+
+
+def writes_local(insn: Instruction) -> bool:
+    """指令是否写局部变量（store/iinc/ret；含 wide 变体）。"""
+    if insn.opcode in _WRITE_LOCAL:
+        return True
+    if insn.opcode == 0xC4:  # wide：内层指令决定
+        return insn.operand[0] in range(0x36, 0x3B) or insn.operand[0] == 0x84
+    return False
+
+
+def stack_depths(insns: list[Instruction], cp) -> list[int]:
+    """每条指令执行前的栈深（槽数）。
+
+    适用于无跳转的线性方法（含跳转时按顺序近似，仅供保守判断用）。
+    """
+    depths: list[int] = []
+    depth = 0
+    for insn in insns:
+        depths.append(depth)
+        depth += _stack_effect(insn, cp)
+    return depths

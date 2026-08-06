@@ -37,6 +37,20 @@ def adapter_for_filename(filename: str) -> LanguageAdapter:
 
 def list_languages() -> list[dict]:
     return [
-        {"name": a.name, "display": a.display_name, "extensions": list(a.extensions)}
+        {
+            "name": a.name,
+            "display": a.display_name,
+            "extensions": list(a.extensions),
+            "features": dict(a.features),
+        }
         for a in ADAPTERS
     ]
+
+
+def features_for(name: str) -> dict[str, bool]:
+    """返回语言支持的混淆特性（pass 名 -> 出厂默认开关）。
+
+    未声明（未来扩展能力）时视为全支持。用于 CLI 按语言
+    自动选择可用开关、对不适用的开关给出提示。
+    """
+    return dict(get_adapter(name).features)

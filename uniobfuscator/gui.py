@@ -18,7 +18,7 @@ import sys
 import flet as ft
 
 from .cli import main as cli_main
-from .config import load_config, split_config
+from .config import ensure_default_config, load_config, split_config
 
 LANG_OPTIONS = [
     ft.DropdownOption(key="auto", text="自动识别"),
@@ -361,6 +361,9 @@ class UniObfuscatorApp:
 
 
 def main() -> None:
+    created = ensure_default_config()
+    if created:
+        print(f"已生成默认配置文件: {created}（编辑后自动生效）", file=sys.stderr)
     try:
         ft.run(UniObfuscatorApp)
     except ImportError:

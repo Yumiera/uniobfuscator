@@ -87,3 +87,32 @@ def test_load_config_fills_form(app, tmp_path):
     assert app.seed_field.value == "7"
     assert app.lang_dropdown.value == "java"
     assert app.sw_rename.value is False
+
+
+def test_gui_main_creates_default_config(tmp_path, capsys, monkeypatch):
+    """GUI 启动路径：启动目录无 config 文件夹时创建并写入默认 toml。"""
+    import uniobfuscator.gui as gui
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(gui.ft, "run", lambda app: None)
+    gui.main()
+    captured = capsys.readouterr()
+    cfg = tmp_path / "config" / "uniobfuscator.toml"
+    assert cfg.exists()
+    assert "已生成默认配置文件" in captured.err
+    assert "rename = true" in cfg.read_text(encoding="utf-8")
+
+
+def test_gui_main_reuses_existing_config(tmp_path, capsys, monkeypatch):
+    """已存在 config/uniobfuscator.toml 时不再覆盖用户修改。"""
+    import uniobfuscator.gui as gui
+
+    monkeypatch.chdir(tmp_path)
+    cfg = tmp_path / "config" / "uniobfuscator.toml"
+    cfg.parent.mkdir()
+    cfg.write_text("seed = 9\n", encoding="utf-8")
+    monkeypatch.setattr(gui.ft, "run", lambda app: None)
+    gui.main()
+    captured = capsys.readouterr()
+    assert "已生成默认配置文件" not in captured.err
+    assert cfg.read_text(encoding="utf-8") == "seed = 9\n"

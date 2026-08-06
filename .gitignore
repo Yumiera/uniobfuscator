@@ -9,9 +9,12 @@ build/
 *.obf.js
 *.obf.java
 
-# 输出目录与个人配置（保留 config/*.example.toml 模板）
+# 输出目录与个人配置（配置模板由 uniobfuscator/config.py 自动生成）
 out/
 config/uniobfuscator.toml
+
+# 端到端验证临时目录
+_e2e_tmp/
 
 # 本地运行日志
 debug.log

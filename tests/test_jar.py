@@ -9,6 +9,8 @@ import pytest
 
 from uniobfuscator.jvm.classfile import (
     CONSTANT_Class,
+    CONSTANT_Methodref,
+    CONSTANT_NameAndType,
     CONSTANT_String,
     Attribute,
     ClassFile,
@@ -292,7 +294,8 @@ def test_jar_end_to_end(tmp_path):
         z.writestr("pkg/T.class", build_class())
         z.writestr("README.txt", "keep me")
 
-    stats = obfuscate_jar(str(src_file), str(out_file), seed=5)
+    stats = obfuscate_jar(str(src_file), str(out_file), seed=5,
+                          arithmetic=False, dead_code=False, scramble=False)
     assert stats["class"] == 1
     assert stats["signature"] == 1
     assert any("签名" in w for w in stats["warnings"])
@@ -319,6 +322,54 @@ def test_obfuscate_jar_invalid_zip(tmp_path):
         obfuscate_jar(str(src), str(tmp_path / "out.jar"))
 
 
+def test_jar_exclude_exact_class(tmp_path):
+    """--exclude 精确类：该类原样保留（含调试信息），其余正常混淆。"""
+    src_file = tmp_path / "app.jar"
+    with zipfile.ZipFile(str(src_file), "w") as z:
+        z.writestr("pkg/T.class", build_class())  # 带 LineNumberTable/SourceFile
+        z.writestr("pkg/U.class", build_class())
+    out = tmp_path / "out.jar"
+    stats = obfuscate_jar(str(src_file), str(out), seed=5, exclude=["pkg.T"],
+                          arithmetic=False, dead_code=False, scramble=False)
+    assert stats["class"] == 1 and stats["excluded"] == 1
+    with zipfile.ZipFile(str(out)) as z:
+        assert z.read("pkg/T.class") == build_class()  # 原样，逐字节一致
+        obf_u = parse_class_file(z.read("pkg/U.class"))
+        opcodes = [i.opcode for i in obf_u.methods[0].code().instructions]
+        assert opcodes == [0x13, 0xB8, 0xB0]  # U 正常混淆
+
+
+def test_jar_exclude_package(tmp_path):
+    """--exclude pkg.*：整个包原样保留。"""
+    src_file = tmp_path / "app.jar"
+    with zipfile.ZipFile(str(src_file), "w") as z:
+        z.writestr("pkg/a/T.class", build_class())
+        z.writestr("pkg/a/b/U.class", build_class())
+    out = tmp_path / "out.jar"
+    stats = obfuscate_jar(str(src_file), str(out), seed=5, exclude=["pkg.a.*"])
+    assert stats["class"] == 0 and stats["excluded"] == 2
+    with zipfile.ZipFile(str(out)) as z:
+        assert z.read("pkg/a/T.class") == build_class()
+        assert z.read("pkg/a/b/U.class") == build_class()
+
+
+def test_cli_jar_exclude(tmp_path, monkeypatch, capsys):
+    """CLI --exclude：被排除类原样保留。"""
+    monkeypatch.chdir(tmp_path)
+    src_file = tmp_path / "app.jar"
+    with zipfile.ZipFile(str(src_file), "w") as z:
+        z.writestr("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\r\n")
+        z.writestr("pkg/T.class", build_class())
+    out = tmp_path / "out.jar"
+    from uniobfuscator.cli import main
+    rc = main([str(src_file), "-o", str(out), "--exclude", "pkg.T"])
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    assert "排除 1 个" in captured.out
+    with zipfile.ZipFile(str(out)) as z:
+        assert z.read("pkg/T.class") == build_class()
+
+
 def test_cli_jar_obfuscates(tmp_path, monkeypatch, capsys):
     """CLI 直接混淆 .jar，输出默认 *.obf.jar。"""
     monkeypatch.chdir(tmp_path)
@@ -335,4 +386,206 @@ def test_cli_jar_obfuscates(tmp_path, monkeypatch, capsys):
     with zipfile.ZipFile(str(out)) as z:
         cf = parse_class_file(z.read("pkg/T.class"))
         opcodes = [i.opcode for i in cf.methods[0].code().instructions]
-        assert opcodes == [0x13, 0xB8, 0xB0]
+        # 默认开启全部 pass：字符串加密（ldc_w+invokestatic）+ 死代码注入（iconst_0 前缀）
+        assert opcodes[0] == 0x03 and 0x99 in opcodes
+        assert 0x13 in opcodes and 0xB8 in opcodes and opcodes[-1] == 0xB0
+
+
+# ---------------------------------------------------------------------------
+# 新增 Java 混淆 pass
+# ---------------------------------------------------------------------------
+
+def _build_const_class(value: int = 42) -> bytes:
+    """int f() { return value; } —— sipush value; ireturn。"""
+    cp = ConstantPool()
+    this = cp.add(CONSTANT_Class, cp.add_utf8("T"))
+    superc = cp.add(CONSTANT_Class, cp.add_utf8("java/lang/Object"))
+    code_utf = cp.add_utf8("Code")
+    code = CodeAttribute(1, 1,
+                         [Instruction(0x11, struct.pack(">h", value)), Instruction(0xAC)],
+                         [], [], code_utf)
+    method = MethodInfo(0x0009, cp.add_utf8("f"), cp.add_utf8("()I"), [code])
+    return ClassFile(cp, 0x0021, this, superc, [], [], [method], []).serialize()
+
+
+def _build_multi_statement_class() -> bytes:
+    """void f() { nanoTime(); nanoTime(); nanoTime(); } —— 3 条栈深 0 语句。"""
+    cp = ConstantPool()
+    this = cp.add(CONSTANT_Class, cp.add_utf8("T"))
+    superc = cp.add(CONSTANT_Class, cp.add_utf8("java/lang/Object"))
+    code_utf = cp.add_utf8("Code")
+    sys_class = cp.add(CONSTANT_Class, cp.add_utf8("java/lang/System"))
+    mref = cp.add(CONSTANT_Methodref, sys_class,
+                  cp.add(CONSTANT_NameAndType, cp.add_utf8("nanoTime"), cp.add_utf8("()J")))
+    insns = [Instruction(0xB8, struct.pack(">H", mref)), Instruction(0x58)] * 3 \
+        + [Instruction(0xB1)]  # invokestatic nanoTime; pop2（x3）; return
+    code = CodeAttribute(2, 1, insns, [], [], code_utf)
+    method = MethodInfo(0x0009, cp.add_utf8("f"), cp.add_utf8("()V"), [code])
+    return ClassFile(cp, 0x0021, this, superc, [], [], [method], []).serialize()
+
+
+def test_arithmetic_obfuscate():
+    """整型常量算术混淆：sipush 42 -> 双常量表达式，32 位求值仍为 42。"""
+    from uniobfuscator.jvm.passes import arithmetic_obfuscate
+    cf = parse_class_file(_build_const_class(42))
+    assert arithmetic_obfuscate(cf, seed=7) == 1
+    insns = cf.methods[0].code().instructions
+    assert len(insns) == 4
+    a = struct.unpack(">h", insns[0].operand)[0]
+    if insns[1].opcode == 0x11:
+        b = struct.unpack(">h", insns[1].operand)[0]
+    else:  # ldc Integer
+        b = cf.cp[int.from_bytes(insns[1].operand, "big")][1]
+    if insns[2].opcode == 0x82:  # ixor
+        result = a ^ b
+    else:                        # iadd
+        result = a + b
+    assert (result & 0xFFFFFFFF) == (42 & 0xFFFFFFFF)
+    assert insns[3].opcode == 0xAC
+    # 序列化 round-trip 稳定
+    out = parse_class_file(cf.serialize())
+    assert len(out.methods[0].code().instructions) == 4
+
+
+def test_inject_dead_code():
+    """死代码注入：无分支方法获得不透明谓词 + StackMapTable。"""
+    from uniobfuscator.jvm.passes import inject_dead_code
+    cf = parse_class_file(_build_const_class(42))
+    assert inject_dead_code(cf, seed=1) == 1
+    code = cf.methods[0].code()
+    # ()I static：入口 locals=0，新变量占槽 0，无需扩大 max_locals（原本为 1）
+    assert code.max_locals == 1
+    names = {cf.cp.utf8(a.name_index) for a in code.attributes}
+    assert "StackMapTable" in names
+    opcodes = [i.opcode for i in code.instructions]
+    assert opcodes[0] == 0x03  # iconst_0 开头
+    assert 0x99 in opcodes and 0xA7 in opcodes  # ifeq + goto
+    # round-trip 稳定
+    out = parse_class_file(cf.serialize())
+    assert len(out.methods[0].code().instructions) == len(opcodes)
+
+
+def test_inject_dead_code_slot_after_params():
+    """死代码变量槽位 = 参数之后第一个空闲槽（APPEND 帧追加位置），
+    而非 max_locals：否则与 StackMapTable 槽位错位，真实 JVM VerifyError。"""
+    from uniobfuscator.jvm.passes import inject_dead_code
+    cp = ConstantPool()
+    this = cp.add(CONSTANT_Class, cp.add_utf8("T"))
+    superc = cp.add(CONSTANT_Class, cp.add_utf8("java/lang/Object"))
+    code_utf = cp.add_utf8("Code")
+    # static int f(long a, int b) { return b; }
+    code = CodeAttribute(2, 3,
+                         [Instruction(0x1C), Instruction(0xAC)],  # iload_2; ireturn
+                         [], [], code_utf)
+    method = MethodInfo(0x0009, cp.add_utf8("f"),
+                        cp.add_utf8("(JI)I"), [code])
+    cf = ClassFile(cp, 0x0021, this, superc, [], [], [method], [])
+    assert inject_dead_code(cf, seed=1) == 1
+    insns = cf.methods[0].code().instructions
+    # 新变量槽 = 参数槽数（long 2 + int 1 = 3）
+    istore = [i for i in insns if i.opcode == 0x36][0]
+    assert int.from_bytes(istore.operand, "big") == 3
+    assert cf.methods[0].code().max_locals == max(3, 3 + 1)  # 4
+
+
+def test_scramble_control_flow():
+    """控制流打散：多语句方法插入 goto+垃圾块并携带 StackMapTable。"""
+    from uniobfuscator.jvm.passes import scramble_control_flow
+    cf = parse_class_file(_build_multi_statement_class())
+    assert scramble_control_flow(cf, seed=3) == 1
+    code = cf.methods[0].code()
+    assert code.max_stack >= 2
+    names = {cf.cp.utf8(a.name_index) for a in code.attributes}
+    assert "StackMapTable" in names
+    opcodes = [i.opcode for i in code.instructions]
+    assert opcodes.count(0xA7) == 6  # 3 个 goto 垃圾块 + 3 个跳回
+    out = parse_class_file(cf.serialize())
+    assert len(out.methods[0].code().instructions) == len(opcodes)
+
+
+def _build_pair_class(internal: str, super_internal: str) -> bytes:
+    """构造 class，this=internal、super=super_internal（用于引用关系测试）。"""
+    cp = ConstantPool()
+    this = cp.add(CONSTANT_Class, cp.add_utf8(internal))
+    superc = cp.add(CONSTANT_Class, cp.add_utf8(super_internal))
+    code_utf = cp.add_utf8("Code")
+    code = CodeAttribute(0, 1, [Instruction(0xB1)], [], [], code_utf)
+    method = MethodInfo(0x0009, cp.add_utf8("f"), cp.add_utf8("()V"), [code])
+    return ClassFile(cp, 0x0021, this, superc, [], [], [method], []).serialize()
+
+
+def test_jar_rename_classes(tmp_path):
+    """类名重命名：zip 路径、常量池引用、MANIFEST Main-Class 全部同步。"""
+    src_file = tmp_path / "app.jar"
+    with zipfile.ZipFile(str(src_file), "w") as z:
+        z.writestr("META-INF/MANIFEST.MF",
+                   "Manifest-Version: 1.0\r\nMain-Class: com.demo.App\r\n")
+        z.writestr("com/demo/App.class",
+                   _build_pair_class("com/demo/App", "com/demo/Base"))
+        z.writestr("com/demo/Base.class",
+                   _build_pair_class("com/demo/Base", "java/lang/Object"))
+    out = tmp_path / "out.jar"
+    stats = obfuscate_jar(str(src_file), str(out), seed=1, rename=True)
+    assert stats["renamed"] == 2
+    with zipfile.ZipFile(str(out)) as z:
+        names = set(z.namelist())
+        assert "com/demo/App.class" not in names
+        assert "com/demo/Base.class" not in names
+        new_names = sorted(n for n in names if n.endswith(".class"))
+        assert len(new_names) == 2
+        this_names, super_names = set(), set()
+        for n in new_names:
+            cf = parse_class_file(z.read(n))
+            this_names.add(cf.this_name())
+            super_names.add(cf.cp.utf8(cf.cp[cf.super_class][1]))
+        assert "com/demo/App" not in this_names and "com/demo/Base" not in this_names
+        assert "com/demo/Base" not in super_names  # 子类 super 已指向新名
+        assert "java/lang/Object" in super_names
+        manifest = z.read("META-INF/MANIFEST.MF").decode("utf-8").replace("\r", "")
+        assert "Main-Class: com.demo.App" not in manifest
+        assert "Main-Class: com.demo." in manifest
+
+
+def test_jar_rename_excludes_class(tmp_path):
+    """类名重命名 + 排除：被排除类不改名，但其对重命名类的引用同步更新。"""
+    src_file = tmp_path / "app.jar"
+    with zipfile.ZipFile(str(src_file), "w") as z:
+        z.writestr("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\r\n")
+        z.writestr("pkg/Main.class",
+                   _build_pair_class("pkg/Main", "pkg/Secret"))
+        z.writestr("pkg/Secret.class",
+                   _build_pair_class("pkg/Secret", "java/lang/Object"))
+    out = tmp_path / "out.jar"
+    stats = obfuscate_jar(str(src_file), str(out), seed=1, rename=True,
+                          exclude=["pkg.Secret"])
+    assert stats["renamed"] == 1 and stats["excluded"] == 1
+    with zipfile.ZipFile(str(out)) as z:
+        names = set(z.namelist())
+        assert "pkg/Secret.class" in names  # 被排除类保持原名
+        main_names = [n for n in names if n != "pkg/Secret.class" and n.endswith(".class")]
+        assert len(main_names) == 1
+        cf = parse_class_file(z.read(main_names[0]))
+        assert cf.this_name() != "pkg/Main"  # Main 本身被重命名
+        super_name = cf.cp.utf8(cf.cp[cf.super_class][1])
+        assert super_name == "pkg/Secret"  # 被排除类不改名，引用保持不变
+
+
+def test_cli_jar_warns_text_flags(tmp_path, monkeypatch, capsys):
+    """JAR 模式传文本专属开关：警告并忽略（java_* 仍按默认生效）。"""
+    src_file = tmp_path / "app.jar"
+    with zipfile.ZipFile(str(src_file), "w") as z:
+        z.writestr("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\r\n")
+        z.writestr("pkg/T.class", build_class())
+    out = tmp_path / "out.jar"
+    monkeypatch.chdir(tmp_path)
+    from uniobfuscator.cli import main
+    rc = main([str(src_file), "-o", str(out), "--no-dead-code"])
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    # --no-dead-code 是文本专属开关：警告并忽略
+    assert "仅适用于 文本源码混淆" in captured.err
+    with zipfile.ZipFile(str(out)) as z:
+        cf = parse_class_file(z.read("pkg/T.class"))
+        opcodes = [i.opcode for i in cf.methods[0].code().instructions]
+        # java_dead_code 默认仍开启：iconst_0 前缀 + ifeq
+        assert opcodes[0] == 0x03 and 0x99 in opcodes

@@ -200,3 +200,68 @@ def test_cli_dir_warns_binary_artifacts(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "跳过 1 个非源码文件" in r.stderr
     assert (out_dir / "Main.java").exists()
+
+
+# ---------------------------------------------------------------------------
+# 按语言切换混淆选项（能力矩阵 + CLI 自动切换 + 提示）
+# ---------------------------------------------------------------------------
+
+TEXT_FEATURES = {"rename", "strings", "dead_code", "arithmetic"}
+
+
+def test_features_capability_matrix():
+    """能力矩阵：文本语言声明 4 项特性；JAR 模式另有 java_* 系列。"""
+    from uniobfuscator.jvm import JAR_FEATURES
+    from uniobfuscator.languages import features_for, list_languages
+
+    for lang in ("python", "javascript", "java"):
+        feats = features_for(lang)
+        assert set(feats) == TEXT_FEATURES
+        assert all(feats.values())  # 出厂默认全部开启
+
+    assert set(JAR_FEATURES) == {
+        "strings", "java_arithmetic", "java_dead_code", "java_scramble",
+        "java_rename",
+    }
+    # strings 为文本/JAR 共享；java_rename 破坏性最强默认关闭
+    assert JAR_FEATURES["strings"] is True
+    assert JAR_FEATURES["java_rename"] is False
+
+    for item in list_languages():
+        assert set(item["features"]) == TEXT_FEATURES
+
+
+def test_build_options_language_features_defaults():
+    """语言能力默认值参与选项合并：features 覆盖内置默认，CLI 显式参数优先。"""
+    from uniobfuscator.cli import _build_options
+
+    class _Args:  # 模拟 argparse.Namespace：所有开关未指定（None）
+        seed = rename = strings = dead_code = arithmetic = None
+        exclude = java_arithmetic = java_dead_code = None
+        java_scramble = java_rename = None
+
+    # 语言出厂默认只声明部分特性：声明的覆盖内置默认，未声明的保持默认
+    opts = _build_options(_Args(), features={"rename": False, "strings": False})
+    assert opts["rename"] is False and opts["strings"] is False
+    assert opts["dead_code"] is True
+    assert opts.get("java_rename") is None  # 未声明 JAR 特性则不包含
+
+    # 命令行显式参数 > 语言能力默认
+    args = _Args()
+    args.rename = True
+    assert _build_options(args, features={"rename": False})["rename"] is True
+
+
+def test_cli_text_warns_jar_flags(tmp_path):
+    """文本源码混淆时传 JAR 专属开关：警告并忽略，不影响输出。"""
+    src = tmp_path / "a.py"
+    src.write_text("x = 1\nprint(x + 2)\n", encoding="utf-8")
+    out = tmp_path / "a_obf.py"
+    r = subprocess.run(
+        [sys.executable, "-m", "uniobfuscator.cli", str(src), "-o", str(out),
+         "--java-scramble"],
+        capture_output=True, text=True, timeout=60, cwd=str(tmp_path),
+    )
+    assert r.returncode == 0, r.stderr
+    assert "仅适用于 JAR 字节码模式" in r.stderr
+    assert out.exists()

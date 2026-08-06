@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+dist/
+build/
+*.obf.py
+*.obf.js
+*.obf.java
+
+# 输出目录与个人配置（保留 config/*.example.toml 模板）
+out/
+config/uniobfuscator.toml
+
+# IDE / 本地工具配置
+.idea/
+.trae/

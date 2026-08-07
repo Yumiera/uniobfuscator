@@ -58,6 +58,38 @@ def build_rename_map(internal_names, seed: int = 0, excluded=()) -> dict[str, st
     return name_map
 
 
+def build_repackage_map(internal_names, seed: int = 0, excluded=(),
+                        prefix: str = "a") -> dict[str, str]:
+    """把可重命名类平铺到单一短包（repackage），类名全局唯一短名。
+
+    - 所有非排除类都移到前缀包（默认 "a"）下，包路径信息被抹平，
+      分析者无法从包名推断模块/业务结构（对应 ProGuard -repackageclasses）；
+    - excluded 的类保留原包路径（反射/框架加载的关键类）；
+    - 前缀包若与 jar 内现有顶层包冲突，自动追加短名避让；
+    - 简单名在全部可重命名类范围内唯一（seed 洗牌，可复现）。
+
+    注意：不同包之间的 package-private（默认访问）访问在源码层已被
+    编译器禁止，因此 repackage 到同包不会破坏既有访问语义。
+    """
+    excluded = set(excluded)
+    renameable = [n for n in internal_names if n not in excluded]
+    if not renameable:
+        return {}
+    top_pkgs = {n.split("/")[0] for n in internal_names if "/" in n}
+    pkg = prefix
+    k = 0
+    while pkg in top_pkgs:  # 前缀包与现有包冲突则避让
+        k += 1
+        pkg = prefix + _short_name(k)
+    rng = random.Random(seed)
+    order = list(range(len(renameable)))
+    rng.shuffle(order)
+    name_map = {}
+    for name, pos in zip(renameable, order):
+        name_map[name] = f"{pkg}/{_short_name(pos)}"
+    return name_map
+
+
 def apply_rename(class_file: ClassFile, name_map: dict[str, str]) -> int:
     """把常量池里指向被重命名类的 Class 常量更新为新名。返回更新的常量数。"""
     cp = class_file.cp

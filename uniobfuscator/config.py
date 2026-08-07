@@ -49,6 +49,7 @@ GLOBAL_KEYS = frozenset({
     "rename", "strings", "dead_code", "arithmetic", "languages",
     "exclude",
     "java_arithmetic", "java_dead_code", "java_scramble", "java_rename",
+    "java_member_rename", "java_repackage", "java_strip_metadata",
 })
 
 #: 按语言分组里允许出现的字段
@@ -87,11 +88,14 @@ arithmetic = true           # 算术混淆
 # 格式：精确类名 'com.foo.Secret' 或包前缀 'com.foo.secret.*'（含子包）
 # exclude = ["com.foo.Secret", "com.foo.secret.*"]
 
-# JAR 字节码混淆开关（.jar；默认除类名重命名外全部开启）
+# JAR 字节码混淆开关（.jar；默认除类名/包名/成员重命名外全部开启）
 # java_arithmetic = true    # 整型常量算术混淆
 # java_dead_code = true     # 死代码注入（不透明谓词，仅无分支方法）
 # java_scramble = true      # 控制流打散（栈平衡垃圾块 + goto 绕行）
-# java_rename = false       # 类名重命名（改常量池引用；反射/框架需配合 exclude）
+# java_strip_metadata = true  # 剥离泛型签名 / throws / 运行期不可见注解
+# java_rename = false       # 类名重命名（保留包路径；反射/框架目标自动保护）
+# java_repackage = false    # 包名混淆：平铺到单一短包 + 全局短类名（破坏性最强）
+# java_member_rename = false  # 私有方法/字段重命名（Serializable 字段自动保护）
 
 # ---------------- 按语言配置（覆盖对应语言的全局默认） ----------------
 # 每个语言段可单独设置：seed / rename / strings / dead_code / arithmetic。

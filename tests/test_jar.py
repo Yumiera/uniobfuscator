@@ -9,6 +9,10 @@ import pytest
 
 from uniobfuscator.jvm.classfile import (
     CONSTANT_Class,
+    CONSTANT_Fieldref,
+    CONSTANT_InterfaceMethodref,
+    CONSTANT_InvokeDynamic,
+    CONSTANT_Long,
     CONSTANT_Methodref,
     CONSTANT_NameAndType,
     CONSTANT_String,
@@ -88,7 +92,7 @@ def test_remove_debug_info():
 
 
 def test_encrypt_strings():
-    """字符串加密：ldc -> ldc_w 密文 + invokestatic，helper 注入，密文非原文。"""
+    """字符串加密：ldc -> ldc_w 密文 + sipush key + invokestatic，helper 注入。"""
     cf = parse_class_file(build_class(with_debug=False))
     encrypt_strings(cf, seed=5)
     out = parse_class_file(cf.serialize())
@@ -97,14 +101,16 @@ def test_encrypt_strings():
     helper_names = {out.cp.utf8(m.name_index) for m in out.methods}
     assert "_u5" in helper_names
 
-    # f() 的指令：ldc_w + invokestatic，不再有 ldc
+    # f() 的指令：ldc_w 密文 + sipush key + invokestatic，不再有 ldc
     code = out.methods[0].code()
     opcodes = [i.opcode for i in code.instructions]
-    assert opcodes == [0x13, 0xB8, 0xB0]
+    assert opcodes == [0x13, 0x11, 0xB8, 0xB0]
 
-    # ldc_w 现在加载的是密文字符串常量（原文常量保留在池中，但不再被引用）
+    # ldc_w 加载的是密文字符串；sipush 是独立密钥（seed=5 派生 rng 首值 68）
     str_idx = int.from_bytes(code.instructions[0].operand, "big")
-    assert out.cp.utf8(out.cp[str_idx][1]) == "".join(chr(ord(c) ^ 0xA2) for c in "hello")
+    key = struct.unpack(">h", code.instructions[1].operand)[0]
+    assert key == 68
+    assert out.cp.utf8(out.cp[str_idx][1]) == "".join(chr(ord(c) ^ key) for c in "hello")
 
 
 def test_helper_stack_map_table():
@@ -118,13 +124,13 @@ def test_helper_stack_map_table():
     assert smt, "含分支的 helper 必须携带 StackMapTable，否则 JVM 抛 VerifyError"
     payload = smt[0].payload
     assert int.from_bytes(payload[:2], "big") == 2  # 2 个 frame
-    # entry1: APPEND(2) frame（251+2=253），delta=9（循环头，goto 目标）：Object("[C") + Integer
-    # 规范：首帧 offset = offset_delta
+    # entry1: APPEND(2) frame（251+2=253），delta=9（循环头 @9，goto 目标）：
+    # Object("[C") + Integer
     assert payload[2] == 0xFD
     assert int.from_bytes(payload[3:5], "big") == 9
     assert payload[5] == 7 and payload[8] == 1
-    # entry2: SAME frame（frame_type=24）：offset = 9 + 24 + 1 = 34（循环退出，if_icmpge 目标）
-    assert payload[9] == 24
+    # entry2: SAME frame（frame_type=22）：offset = 9 + 22 + 1 = 32（循环退出，if_icmpge 目标）
+    assert payload[9] == 22
     # round-trip 后 StackMapTable 仍存在且内容一致
     out = parse_class_file(cf.serialize())
     helper2 = [m for m in out.methods if out.cp.utf8(m.name_index) == "_u5"][0]
@@ -158,7 +164,7 @@ def test_encrypt_loop_method_remaps_smt():
             iload_2@5(循环头); bipush 10; if_icmpge 14; iinc 2,1;
             aload_1@14(循环出口); areturn
     SMT：APPEND(2)@5（Object String + Integer）、SAME@14。
-    加密后 ldc -> ldc_w+invokestatic（+5 字节）：循环头 -> 9，出口 -> 18。
+    加密后 ldc -> ldc_w+sipush+invokestatic（净增 7 字节）：循环头 -> 12，出口 -> 21。
     """
     cp = ConstantPool()
     hello = cp.add_utf8("hello")
@@ -196,9 +202,9 @@ def test_encrypt_loop_method_remaps_smt():
             if out.cp.utf8(a.name_index) == "StackMapTable"][0]
     p = smt2.payload
     assert p[:2] == struct.pack(">H", 2)
-    assert p[2] == 0xFD and int.from_bytes(p[3:5], "big") == 9   # APPEND(2) @9
+    assert p[2] == 0xFD and int.from_bytes(p[3:5], "big") == 12   # APPEND(2) @12
     assert p[5] == 7 and p[8] == 1
-    assert p[9] == 8                                            # SAME @18（18-9-1=8）
+    assert p[9] == 8                                            # SAME @21（21-12-1=8）
     # 二次序列化（identity 映射）逐字节一致
     assert parse_class_file(out.serialize()).serialize() == out.serialize()
 
@@ -215,7 +221,7 @@ def test_encrypt_strings_skips_non_ascii_control():
     cf = ClassFile(cp, 0x0021, this, superc, [], [],
                    [MethodInfo(0x0009, cp.add_utf8("f"), cp.add_utf8("()Ljava/lang/String;"),
                                [code])], [])
-    encrypt_strings(cf, seed=0)  # key=7; 'a'(97)^7 = 102 = 'f'，无 NUL，应加密
+    encrypt_strings(cf, seed=0)  # 派生 rng 首值 key=72；'a'(97)^72=41 无 NUL，应加密
     assert cf.methods[0].code().instructions[0].opcode == 0x13
     # key 使密文为 NUL 的场景：选 'a' 且 key=97 → 需要 seed 使 key=97
     cp2 = ConstantPool()
@@ -228,8 +234,8 @@ def test_encrypt_strings_skips_non_ascii_control():
     cf2 = ClassFile(cp2, 0x0021, this2, sup2, [], [],
                     [MethodInfo(0x0009, cp2.add_utf8("f"), cp2.add_utf8("()Ljava/lang/String;"),
                                 [code2])], [])
-    # 找 key=97 的 seed：97 = (s*31+7)&0xFF → s=77? (77*31+7)=2394 → 2394&0xFF=0x5A=90。手算太繁，
-    # 直接验证不变量：无论 key 如何，加密后要么是密文+invokestatic，要么保持 ldc 明文（跳过）。
+    # 找 key=97 的 seed：97 = rng.randrange(256) 首值。直接验证不变量：无论 key
+    # 如何，加密后要么是密文+invokestatic，要么保持 ldc 明文（跳过）。
     encrypt_strings(cf2, seed=99)
     first = cf2.methods[0].code().instructions[0]
     if first.opcode == 0x12:
@@ -311,7 +317,7 @@ def test_jar_end_to_end(tmp_path):
                       for a in (m.code().attributes if m.code() else [])}
         assert "LineNumberTable" not in code_attrs
         opcodes = [i.opcode for i in obf_class.methods[0].code().instructions]
-        assert opcodes == [0x13, 0xB8, 0xB0]
+        assert opcodes == [0x13, 0x11, 0xB8, 0xB0]
 
 
 def test_obfuscate_jar_invalid_zip(tmp_path):
@@ -336,7 +342,7 @@ def test_jar_exclude_exact_class(tmp_path):
         assert z.read("pkg/T.class") == build_class()  # 原样，逐字节一致
         obf_u = parse_class_file(z.read("pkg/U.class"))
         opcodes = [i.opcode for i in obf_u.methods[0].code().instructions]
-        assert opcodes == [0x13, 0xB8, 0xB0]  # U 正常混淆
+        assert opcodes == [0x13, 0x11, 0xB8, 0xB0]  # U 正常混淆
 
 
 def test_jar_exclude_package(tmp_path):
@@ -589,3 +595,101 @@ def test_cli_jar_warns_text_flags(tmp_path, monkeypatch, capsys):
         opcodes = [i.opcode for i in cf.methods[0].code().instructions]
         # java_dead_code 默认仍开启：iconst_0 前缀 + ifeq
         assert opcodes[0] == 0x03 and 0x99 in opcodes
+
+
+# ---------------------------------------------------------------------------
+# 真实 javac 输出形态回归测试（t8 端到端验证发现的真实 JVM bug）
+# ---------------------------------------------------------------------------
+
+def test_parse_class_with_long_constant():
+    """含 long 常量（serialVersionUID 场景）的 class：cp_count 按槽位计数，
+    占位槽无 tag 字节，解析与 round-trip 必须逐字节一致。"""
+    cp = ConstantPool([None, (CONSTANT_Long, 1), None])  # 槽1=Long，槽2=占位
+    this = cp.add(CONSTANT_Class, cp.add_utf8("T"))
+    superc = cp.add(CONSTANT_Class, cp.add_utf8("java/lang/Object"))
+    cf = ClassFile(cp, 0x0021, this, superc, [], [], [], [])
+    raw = cf.serialize()
+    cf2 = parse_class_file(raw)
+    assert cf2.serialize() == raw
+    assert cf2.cp[1][0] == CONSTANT_Long and cf2.cp[2] is None
+
+
+def _build_invoke_class() -> bytes:
+    """含 invokeinterface + invokedynamic 的方法（Java 9+ 字符串拼接形态）。"""
+    cp = ConstantPool()
+    this = cp.add(CONSTANT_Class, cp.add_utf8("T"))
+    superc = cp.add(CONSTANT_Class, cp.add_utf8("java/lang/Object"))
+    code_utf = cp.add_utf8("Code")
+    list_c = cp.add(CONSTANT_Class, cp.add_utf8("java/util/List"))
+    size_mref = cp.add(CONSTANT_InterfaceMethodref, list_c,
+                       cp.add(CONSTANT_NameAndType, cp.add_utf8("size"),
+                              cp.add_utf8("()I")))
+    nat = cp.add(CONSTANT_NameAndType, cp.add_utf8("makeConcat"),
+                 cp.add_utf8("(Ljava/lang/String;)Ljava/lang/String;"))
+    indy = cp.add(CONSTANT_InvokeDynamic, 0, nat)
+    code = CodeAttribute(2, 1, [
+        Instruction(0xB9, struct.pack(">H", size_mref) + b"\x01\x00"),
+        Instruction(0x57),                                        # pop
+        Instruction(0xBA, struct.pack(">H", indy) + b"\x00\x00"),
+        Instruction(0x57),                                        # pop
+        Instruction(0xB1),                                        # return
+    ], [], [], code_utf)
+    method = MethodInfo(0x0009, cp.add_utf8("f"), cp.add_utf8("()V"), [code])
+    return ClassFile(cp, 0x0021, this, superc, [], [], [method], []).serialize()
+
+
+def test_invoke_effect_4byte_operand():
+    """invokeinterface/invokedynamic 的 4 字节操作数只取前 2 字节作为常量池
+    索引（此前整段读取越界抛 IndexError，真实 javac 代码含 invokedynamic）。"""
+    from uniobfuscator.jvm.code import stack_depths
+    cf = parse_class_file(_build_invoke_class())
+    depths = stack_depths(cf.methods[0].code().instructions, cf.cp)
+    assert depths[0] == 0
+    assert len(depths) == 5
+    # 序列化 round-trip 后仍可解析（操作数 4 字节保留）
+    out = parse_class_file(cf.serialize())
+    assert len(out.methods[0].code().instructions) == 5
+
+
+def _build_init_class() -> bytes:
+    """<init>：super() + 两条 putfield（多条栈深 0 边界，本会触发打散）。"""
+    cp = ConstantPool()
+    this = cp.add(CONSTANT_Class, cp.add_utf8("T"))
+    superc = cp.add(CONSTANT_Class, cp.add_utf8("java/lang/Object"))
+    code_utf = cp.add_utf8("Code")
+    strc = cp.add(CONSTANT_String, cp.add_utf8("x"))
+    field1 = cp.add(CONSTANT_Fieldref, this, cp.add(
+        CONSTANT_NameAndType, cp.add_utf8("a"), cp.add_utf8("Ljava/lang/String;")))
+    field2 = cp.add(CONSTANT_Fieldref, this, cp.add(
+        CONSTANT_NameAndType, cp.add_utf8("b"), cp.add_utf8("I")))
+    obj_init = cp.add(CONSTANT_Methodref, superc, cp.add(
+        CONSTANT_NameAndType, cp.add_utf8("<init>"), cp.add_utf8("()V")))
+    insns = [
+        Instruction(0x2A),                                  # aload_0
+        Instruction(0xB7, struct.pack(">H", obj_init)),     # invokespecial <init>
+        Instruction(0x2A), Instruction(0x12, bytes([strc])),
+        Instruction(0xB5, struct.pack(">H", field1)),       # putfield a
+        Instruction(0x2A), Instruction(0x03),
+        Instruction(0xB5, struct.pack(">H", field2)),       # putfield b
+        Instruction(0xB1),                                  # return
+    ]
+    code = CodeAttribute(2, 1, insns, [], [], code_utf)
+    method = MethodInfo(0x0001, cp.add_utf8("<init>"), cp.add_utf8("()V"), [code])
+    return ClassFile(cp, 0x0021, this, superc, [], [], [method], []).serialize()
+
+
+def test_scramble_skips_init():
+    """打散必须跳过 <init>：locals[0] 有 uninitializedThis->this 转换，
+    SAME 帧无法表示，否则真实 JVM VerifyError。"""
+    from uniobfuscator.jvm.passes import scramble_control_flow
+    cf = parse_class_file(_build_init_class())
+    assert scramble_control_flow(cf, seed=3) == 0
+
+
+def test_encrypt_strings_bumps_max_stack():
+    """字符串加密提升 max_stack：ldc->ldc_w+sipush+invokestatic 瞬时栈深 +1，
+    否则与算术混淆叠加后真实 JVM 报 Exceeded max stack size。"""
+    cf = parse_class_file(build_class(with_debug=False))
+    assert cf.methods[0].code().max_stack == 1
+    encrypt_strings(cf, seed=5)
+    assert cf.methods[0].code().max_stack == 2

@@ -27,6 +27,13 @@ class _FakePage:
         pass
 
 
+class _FakeEvent:
+    """模拟 flet 事件对象：新值只存在于 e.control.value（控件属性未同步）。"""
+
+    def __init__(self, value):
+        self.control = type("C", (), {"value": value})()
+
+
 @pytest.fixture()
 def app():
     return UniObfuscatorApp(_FakePage())
@@ -63,6 +70,41 @@ def test_build_argv_with_config(app):
     assert argv[-2:] == ["-c", "conf.toml"]
 
 
+def test_build_argv_jar_defaults(app):
+    """JAR 输入：默认全开时只传基础参数，不传文本开关（避免 CLI 警告）。"""
+    app.input_field.value = "app.jar"
+    argv = app._build_argv()
+    assert argv == ["app.jar", "--seed", "0"]
+
+
+def test_build_argv_jar_full_options(app):
+    """JAR 输入：JAR 专属开关 + 排除列表，文本开关不传。"""
+    app.input_field.value = "app.jar"
+    app.seed_field.value = "7"
+    app.sw_java_arithmetic.value = False
+    app.sw_java_strip_metadata.value = False
+    app.sw_java_rename.value = True
+    app.sw_java_repackage.value = True
+    app.exclude_field.value = "com.foo.Secret, com.foo.secret.*"
+    argv = app._build_argv()
+    assert argv == [
+        "app.jar", "--seed", "7",
+        "--no-java-arithmetic", "--no-java-strip-metadata",
+        "--java-rename", "--java-repackage",
+        "--exclude", "com.foo.Secret", "--exclude", "com.foo.secret.*",
+    ]
+
+
+def test_build_argv_jar_ignores_text_switches(app):
+    """JAR 输入：文本开关（--no-rename 等）绝不出现。"""
+    app.input_field.value = "app.jar"
+    app.sw_rename.value = False
+    app.sw_dead_code.value = False
+    app.sw_arithmetic.value = False
+    argv = app._build_argv()
+    assert argv == ["app.jar", "--seed", "0"]
+
+
 def test_build_argv_requires_input(app):
     app.input_field.value = "  "
     assert app._build_argv() is None
@@ -87,6 +129,111 @@ def test_load_config_fills_form(app, tmp_path):
     assert app.seed_field.value == "7"
     assert app.lang_dropdown.value == "java"
     assert app.sw_rename.value is False
+
+
+def test_load_config_fills_jar_options(app, tmp_path):
+    """加载配置时 JAR 开关与排除列表回填到界面。"""
+    conf = tmp_path / "conf.json"
+    conf.write_text(json.dumps({
+        "java_rename": True,
+        "java_repackage": True,
+        "java_strip_metadata": False,
+        "exclude": ["com.foo.Secret", "com.foo.secret.*"],
+    }), encoding="utf-8")
+    app.config_field.value = str(conf)
+    asyncio.run(app._on_load_config(None))
+    assert app.sw_java_rename.value is True
+    assert app.sw_java_repackage.value is True
+    assert app.sw_java_strip_metadata.value is False
+    assert app.sw_java_scramble.value is True  # 未配置项保持默认
+    assert app.exclude_field.value == "com.foo.Secret, com.foo.secret.*"
+
+
+def test_render_options_text_mode(app):
+    """Java 语言（或 .java 输入）：显示 Java 配置组（字符串加密 + JAR 专属 + 排除框）。"""
+    app.input_field.value = "Main.java"
+    app._render_options()
+    in_area = set()
+    for c in app.options_area.controls:
+        in_area.add(c)
+        if hasattr(c, "controls"):
+            in_area.update(c.controls)
+    # Java 配置组：JAR 专属开关在，文本开关 rename 不在（整体替换，不叠加）
+    assert app.sw_java_rename in in_area
+    assert app.sw_rename not in in_area
+    assert app.sw_java_repackage in in_area
+    assert app.exclude_field.visible is True
+    assert "Java 混淆" in app.mode_hint.value
+
+
+def test_render_options_text_mode_python(app):
+    """python 源码模式：只显示文本开关，不显示 JAR 专属开关。"""
+    app.input_field.value = "app.py"
+    app.lang_dropdown.value = "python"
+    app._render_options()
+    in_area = set()
+    for c in app.options_area.controls:
+        in_area.add(c)
+        if hasattr(c, "controls"):
+            in_area.update(c.controls)
+    assert app.sw_rename in in_area
+    assert app.sw_java_rename not in in_area
+    assert app.sw_java_repackage not in in_area
+    assert app.exclude_field.visible is False
+
+
+def test_render_options_jar_mode(app):
+    """JAR 输入：显示字符串 + JAR 开关 + 排除框，不显示文本开关。"""
+    app.input_field.value = "app.jar"
+    app._render_options()
+    in_area = set()
+    for c in app.options_area.controls:
+        in_area.add(c)
+        if hasattr(c, "controls"):
+            in_area.update(c.controls)
+    assert app.sw_java_rename in in_area
+    assert app.sw_java_repackage in in_area
+    assert app.sw_rename not in in_area
+    assert app.exclude_field in in_area
+    assert app.exclude_field.visible is True
+    assert "Java 混淆" in app.mode_hint.value
+
+
+def test_render_options_switch_by_language(app):
+    """切换语言后 options_area 随之更新。"""
+    app.input_field.value = "a.js"
+    app.lang_dropdown.value = "javascript"
+    app._on_lang_change(None)
+    assert "javascript 源码混淆" in app.mode_hint.value
+    assert app.exclude_field.visible is False
+    # 切到 jar：输入改 .jar 后渲染出 Java 配置组
+    app.input_field.value = "a.jar"
+    app._render_options()
+    assert app.exclude_field.visible is True
+
+
+def test_on_lang_change_syncs_from_event(app):
+    """flet 事件里新值在 e.control.value 上：必须同步到 lang_dropdown 再渲染。
+
+    模拟真实 flet 回调：控件 .value 仍是旧值（auto），事件对象带新值 java，
+    此时选项区应切换为 Java 配置组（而非停留在 auto 推断的 python 模式）。
+    """
+    app.input_field.value = "app.py"   # auto 推断为 python
+    app.lang_dropdown.value = "auto"   # 控件属性未同步，仍是旧值
+    app._on_lang_change(_FakeEvent("java"))
+    assert app.lang_dropdown.value == "java"
+    assert "Java 混淆" in app.mode_hint.value
+    assert app.exclude_field.visible is True
+
+
+def test_on_lang_change_jar_input_keeps_jar_mode(app):
+    """jar 输入时切换语言不改变 Java 配置组（jar 模式与语言无关）。"""
+    app.input_field.value = "app.jar"
+    app._render_options()
+    app.lang_dropdown.value = "auto"
+    app._on_lang_change(_FakeEvent("java"))
+    assert "Java 混淆" in app.mode_hint.value
+    assert app.exclude_field.visible is True
 
 
 def test_gui_main_creates_default_config(tmp_path, capsys, monkeypatch):

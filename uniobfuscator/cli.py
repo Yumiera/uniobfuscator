@@ -76,9 +76,10 @@ BINARY_ARTIFACT_EXTS = frozenset({
 #: 文本语言专属开关（JAR 模式不适用；strings 为两种形态共享）
 TEXT_ONLY_KEYS = frozenset({"rename", "dead_code", "arithmetic"})
 #: JAR 字节码专属开关（文本模式不适用）
-JAR_ONLY_KEYS = frozenset(
-    {"java_arithmetic", "java_dead_code", "java_scramble", "java_rename"}
-)
+JAR_ONLY_KEYS = frozenset({
+    "java_arithmetic", "java_dead_code", "java_scramble", "java_rename",
+    "java_member_rename", "java_repackage", "java_strip_metadata",
+})
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -108,7 +109,10 @@ def _build_parser() -> argparse.ArgumentParser:
         ("java-arithmetic", True, "JAR 模式整型常量算术混淆"),
         ("java-dead-code", True, "JAR 模式死代码注入（不透明谓词）"),
         ("java-scramble", True, "JAR 模式控制流打散"),
-        ("java-rename", False, "JAR 模式类名重命名（破坏性最强，需配合 --exclude）"),
+        ("java-rename", False, "JAR 模式类名重命名（改常量池引用，需配合 --exclude）"),
+        ("java-member-rename", False, "JAR 模式私有成员重命名（private 方法/字段）"),
+        ("java-repackage", False, "JAR 模式包名混淆（平铺到单一短包 + 全局短类名）"),
+        ("java-strip-metadata", True, "JAR 模式剥离元数据（泛型签名/throws/不可见注解）"),
     ):
         p.add_argument(
             f"--{flag}", dest=flag.replace("-", "_"),
@@ -147,13 +151,15 @@ def _build_options(
     if features:
         options.update(features)  # 语言/形态出厂默认（覆盖内置默认）
     for key in ("seed", "rename", "strings", "dead_code", "arithmetic", "exclude",
-                "java_arithmetic", "java_dead_code", "java_scramble", "java_rename"):
+                "java_arithmetic", "java_dead_code", "java_scramble", "java_rename",
+                "java_member_rename", "java_repackage", "java_strip_metadata"):
         if key in (global_cfg or {}):
             options[key] = global_cfg[key]  # 全局配置
     if per_language and lang_name:
         options.update(per_language.get(lang_name, {}))  # 按语言配置
     for key in ("seed", "rename", "strings", "dead_code", "arithmetic", "exclude",
-                "java_arithmetic", "java_dead_code", "java_scramble", "java_rename"):
+                "java_arithmetic", "java_dead_code", "java_scramble", "java_rename",
+                "java_member_rename", "java_repackage", "java_strip_metadata"):
         value = getattr(args, key)
         if value is not None:
             options[key] = value  # 命令行显式参数
@@ -248,6 +254,9 @@ def _obfuscate_jar_file(
             dead_code=bool(options.get("java_dead_code", True)),
             scramble=bool(options.get("java_scramble", True)),
             rename=bool(options.get("java_rename", False)),
+            member_rename=bool(options.get("java_member_rename", False)),
+            repackage=bool(options.get("java_repackage", False)),
+            strip_meta=bool(options.get("java_strip_metadata", True)),
         )
     except (OSError, ValueError) as e:
         print(f"错误: JAR 混淆失败: {e}", file=sys.stderr)
@@ -257,7 +266,8 @@ def _obfuscate_jar_file(
     print(
         f"JAR 混淆完成: {args.path} -> {out_path} "
         f"（处理 {stats['class']} 个 class，跳过 {stats['skipped']} 个，"
-        f"排除 {stats['excluded']} 个，重命名 {stats['renamed']} 个；"
+        f"排除 {stats['excluded']} 个，重命名 {stats['renamed']} 个类 / "
+        f"{stats['members']} 个成员，剥离元数据 {stats['metadata']}；"
         f"算术 {stats['arithmetic']} / 死代码 {stats['dead_code']} / "
         f"打散 {stats['scramble']}）"
     )

@@ -313,7 +313,11 @@ def parse_class_file(data: bytes) -> ClassFile:
     cp_count = struct.unpack_from(">H", buf, pos)[0]
     pos += 2
     entries: list = [None]
-    for _ in range(cp_count - 1):
+    # cp_count 是槽位数：Long/Double 各占 2 槽，第 2 槽（占位槽）在文件中
+    # 没有 tag 字节。按槽位推进，占位槽只补 None 不读 tag，避免对读取错位
+    # （此前按 cp_count-1 次循环每次读 tag，遇到 Long/Double 会多读 1 字节）。
+    slot = 1
+    while slot < cp_count:
         tag = buf[pos]
         pos += 1
         if tag == CONSTANT_Utf8:
@@ -332,7 +336,8 @@ def parse_class_file(data: bytes) -> ClassFile:
             pos += 4
         elif tag in (CONSTANT_Long, CONSTANT_Double):
             entries.append((tag, struct.unpack_from(">Q", buf, pos)[0]))
-            entries.append(None)  # 占位槽
+            entries.append(None)  # 占位槽（cp_count 计入，但无 tag 字节）
+            slot += 1  # 占位槽已随本项消费
             pos += 8
         elif tag in (CONSTANT_Class, CONSTANT_String, CONSTANT_Module, CONSTANT_Package,
                      CONSTANT_MethodType):
@@ -348,6 +353,7 @@ def parse_class_file(data: bytes) -> ClassFile:
             pos += 3
         else:
             raise ValueError(f"不支持的常量池 tag: {tag} @{pos}")
+        slot += 1
     cp = ConstantPool(entries)
 
     _code_name_index_hint = cp.find_utf8("Code")

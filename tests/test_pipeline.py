@@ -221,11 +221,15 @@ def test_features_capability_matrix():
 
     assert set(JAR_FEATURES) == {
         "strings", "java_arithmetic", "java_dead_code", "java_scramble",
-        "java_rename",
+        "java_rename", "java_member_rename", "java_repackage",
+        "java_strip_metadata",
     }
-    # strings 为文本/JAR 共享；java_rename 破坏性最强默认关闭
+    # strings 为文本/JAR 共享；改名类/成员 pass 破坏性较强默认关闭
     assert JAR_FEATURES["strings"] is True
     assert JAR_FEATURES["java_rename"] is False
+    assert JAR_FEATURES["java_member_rename"] is False
+    assert JAR_FEATURES["java_repackage"] is False
+    assert JAR_FEATURES["java_strip_metadata"] is True
 
     for item in list_languages():
         assert set(item["features"]) == TEXT_FEATURES
@@ -239,6 +243,7 @@ def test_build_options_language_features_defaults():
         seed = rename = strings = dead_code = arithmetic = None
         exclude = java_arithmetic = java_dead_code = None
         java_scramble = java_rename = None
+        java_member_rename = java_repackage = java_strip_metadata = None
 
     # 语言出厂默认只声明部分特性：声明的覆盖内置默认，未声明的保持默认
     opts = _build_options(_Args(), features={"rename": False, "strings": False})

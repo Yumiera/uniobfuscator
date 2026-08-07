@@ -431,7 +431,9 @@ def _stack_effect(insn: Instruction, cp) -> int:
 
 def _invoke_effect(insn: Instruction, cp) -> int:
     """invoke* 的 (返回槽 - 参数槽)。"""
-    idx = int.from_bytes(insn.operand, "big")
+    # 仅取操作数前 2 字节：invokeinterface(0xB9)/invokedynamic(0xBA) 的
+    # 操作数为 4 字节（index + count/保留位），整段读取会得到越界索引。
+    idx = int.from_bytes(insn.operand[:2], "big")
     ref = cp[idx]
     if ref is None:
         return 0

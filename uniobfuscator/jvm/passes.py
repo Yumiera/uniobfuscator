@@ -59,11 +59,6 @@ def remove_debug_info(class_file: ClassFile) -> None:
         ]
 
 
-def _key_for(seed: int) -> int:
-    """由 seed 派生的单字节异或密钥（0-255）。"""
-    return (seed * 31 + 7) & 0xFF
-
-
 def _cipher(s: str, key: int) -> str:
     return "".join(chr(ord(c) ^ key) for c in s)
 
@@ -115,14 +110,16 @@ def _build_stack_map_table(cp, instructions,
 
 
 def _build_decrypt_helper(class_file: ClassFile, seed: int) -> MethodInfo:
-    """构造静态解密方法：static String d_xxx(String s)。
+    """构造静态解密方法：static String _uX(String s, int key)。
 
     实现：把 s 的每个 char 与 key 异或后组装为新 String 返回。
-    class 版本 >= 51 时附带 StackMapTable（split verification 要求）。
+    key 由调用点以常量指令传入（随后会被算术混淆一并处理），
+    实现每字符串独立密钥，避免单一固定密钥。class 版本 >= 51 时
+    附带 StackMapTable（split verification 要求）。
     """
     cp = class_file.cp
     name = cp.add_utf8("_u" + format(seed, "x"))
-    desc = cp.add_utf8("(Ljava/lang/String;)Ljava/lang/String;")
+    desc = cp.add_utf8("(Ljava/lang/String;I)Ljava/lang/String;")
     str_utf = cp.add_utf8("java/lang/String")
     str_class = cp.add(CONSTANT_Class, str_utf)
     length_mref = cp.add(
@@ -137,17 +134,21 @@ def _build_decrypt_helper(class_file: ClassFile, seed: int) -> MethodInfo:
         CONSTANT_Methodref, str_class,
         cp.add(CONSTANT_NameAndType, cp.add_utf8("<init>"), cp.add_utf8("([C)V")),
     )
-    key = _key_for(seed)
     code_utf = cp.add_utf8("Code")
+    # 局部变量：0=s, 1=key, 2=buf, 3=i
+    # 各操作数与局部变量槽严格对应（此前 0x1C/0x2B 等把 s/key/buf/i
+    # 的槽位写错，真实 JVM 报 VerifyError: Instruction type does not
+    # match stack map）
     code_bytes = bytes([
-        0x2A, 0xB6, length_mref >> 8, length_mref & 0xFF, 0xBC, 0x05,   # buf=new char[s.length()]（atype 5=char）
-        0x4C, 0x03, 0x3D,                                              # buf, i=0
-        0x1C, 0x2B, 0xBE, 0xA2, 0x00, 0x16,                            # while(i<buf.length)
-        0x2B, 0x1C, 0x2A, 0x1C,                                        # buf[i]=s.charAt(i)
-        0xB6, charat_mref >> 8, charat_mref & 0xFF, 0x11, 0x00, key,   #   ^ key（sipush 无符号，避免 bipush 符号扩展）
-        0x82, 0x92, 0x55, 0x84, 0x02, 0x01, 0xA7, 0xFF, 0xEA,          #   ; i++
-        0xBB, str_class >> 8, str_class & 0xFF, 0x59, 0x2B,            # new String(buf)
-        0xB7, init_mref >> 8, init_mref & 0xFF, 0xB0,                  # <init>; return
+        0x2A, 0xB6, length_mref >> 8, length_mref & 0xFF, 0xBC, 0x05,   # @0: buf=new char[s.length()]
+        0x4D, 0x03, 0x3E,                                              # @6: astore_2(buf), iconst_0, istore_3(i=0)
+        0x1D, 0x2C, 0xBE, 0xA2, 0x00, 0x14,                            # @9: while(i<buf.length)
+        0x2C, 0x1D, 0x2A, 0x1D,                                        # @15: buf[i]=s.charAt(i)
+        0xB6, charat_mref >> 8, charat_mref & 0xFF, 0x1B,              # @19:   ^ key
+        0x82, 0x92, 0x55, 0x84, 0x03, 0x01,                            # @23: i2c; castore; i++
+        0xA7, 0xFF, 0xEC,                                              # @29: goto 循环头（@9，delta=-20）
+        0xBB, str_class >> 8, str_class & 0xFF, 0x59, 0x2C,            # @32: new String(buf)
+        0xB7, init_mref >> 8, init_mref & 0xFF, 0xB0,                  # @37: <init>; return
     ])
     instructions = parse_code(code_bytes)
     code_attrs: list[Attribute] = []
@@ -156,17 +157,22 @@ def _build_decrypt_helper(class_file: ClassFile, seed: int) -> MethodInfo:
         object_info = bytes([7]) + struct.pack(">H", char_arr_class)
         code_attrs.append(_build_stack_map_table(
             cp, instructions, append_types=(object_info, bytes([1]))))
-    helper_code = CodeAttribute(4, 3, instructions, [], code_attrs, code_utf)
+    helper_code = CodeAttribute(4, 4, instructions, [], code_attrs, code_utf)
     return MethodInfo(0x000A, name, desc, [helper_code])
 
 
 def encrypt_strings(class_file: ClassFile, seed: int) -> None:
-    """加密所有能被 ldc 加载的字符串常量（跳过含非 BMP 字符或密文含 NUL 的）。"""
+    """加密所有能被 ldc 加载的字符串常量（跳过含非 BMP 字符或密文含 NUL 的）。
+
+    每个字符串使用独立随机密钥（由 seed 派生的 rng 产生，可复现）；
+    调用点改为 ldc_w 密文 + sipush key + invokestatic，密钥随后被
+    算术混淆一并处理，不再存在单一固定密钥。
+    """
     cp = class_file.cp
-    key = _key_for(seed)
+    rng = random.Random(seed ^ 0x5EED)
 
     # 1) 找出哪些 String 常量可以加密（其内容不超 BMP、密文无 NUL）
-    encryptable: dict[int, int] = {}  # 原 String 常量索引 -> 密文 String 常量索引
+    encryptable: dict[int, tuple[int, int]] = {}  # 原 String idx -> (密文 idx, key)
     for i in range(1, len(cp.entries)):
         entry = cp.entries[i]
         if entry is None or entry[0] != CONSTANT_String:
@@ -176,10 +182,11 @@ def encrypt_strings(class_file: ClassFile, seed: int) -> None:
             continue
         if any(ord(c) > 0xFFFF for c in s):
             continue
+        key = rng.randrange(256)
         cipher = _cipher(s, key)
         if "\x00" in cipher:
             continue
-        encryptable[i] = cp.add(CONSTANT_String, cp.add_utf8(cipher))
+        encryptable[i] = (cp.add(CONSTANT_String, cp.add_utf8(cipher)), key)
 
     if not encryptable:
         return
@@ -192,24 +199,73 @@ def encrypt_strings(class_file: ClassFile, seed: int) -> None:
     )
     class_file.methods.append(helper)
 
-    # 3) 替换所有方法里的 ldc/ldc_w：明文 -> 密文 + invokestatic
+    # 3) 替换所有方法里的 ldc/ldc_w：明文 -> 密文 + key + invokestatic
     #    用快照遍历，避免把刚注入的 helper 方法也纳入（无害但更清晰）
     for method in list(class_file.methods):
         code = method.code()
         if code is None:
             continue
         new_insns: list[Instruction] = []
+        replaced = False
         for insn in code.instructions:
             if insn.opcode in (0x12, 0x13):  # ldc / ldc_w
                 idx = int.from_bytes(insn.operand, "big")
-                if idx in encryptable:
+                pair = encryptable.get(idx)
+                if pair:
                     # old_offset=-1：占位哨兵，避免与原始指令（偏移>=0）在
                     # offset_mapping 中冲突，保证跳转/StackMapTable 重定位正确
-                    new_insns.append(Instruction(0x13, struct.pack(">H", encryptable[idx]), old_offset=-1))
-                    new_insns.append(Instruction(0xB8, struct.pack(">H", helper_mref), old_offset=-1))
+                    cipher_idx, key = pair
+                    new_insns.append(
+                        Instruction(0x13, struct.pack(">H", cipher_idx), old_offset=-1))
+                    new_insns.append(
+                        Instruction(0x11, struct.pack(">h", key), old_offset=-1))
+                    new_insns.append(
+                        Instruction(0xB8, struct.pack(">H", helper_mref), old_offset=-1))
+                    replaced = True
                     continue
             new_insns.append(insn)
-        code.instructions = new_insns
+        if replaced:
+            code.instructions = new_insns
+            # ldc 单次压栈 -> ldc_w + sipush + invokestatic：瞬时栈深 +1
+            # （否则与算术混淆叠加后 max_stack 不足，真实 JVM 报
+            #  VerifyError: Exceeded max stack size）
+            code.max_stack += 1
+
+
+# ---------------------------------------------------------------------------
+# 元数据剥离
+# ---------------------------------------------------------------------------
+
+#: 可安全剥离的属性：泛型签名 / throws 异常表 / 运行期不可见注解。
+#: 保留 RuntimeVisible*（RUNTIME 注解，反射与框架依赖）与
+#: Code 内的 StackMapTable 等结构性属性。
+_METADATA_STRIP_NAMES = frozenset({
+    "Signature", "Exceptions",
+    "RuntimeInvisibleAnnotations", "RuntimeInvisibleParameterAnnotations",
+})
+
+
+def strip_metadata(class_file: ClassFile) -> int:
+    """剥离泛型签名、throws 声明与运行期不可见注解。返回剥离的属性数。
+
+    泛型签名（Signature）暴露泛型结构；throws（Exceptions）暴露异常设计；
+    不可见注解（CLASS 可见性）运行时反射不可见，仅被字节码处理工具使用。
+    """
+    cp = class_file.cp
+    stripped = 0
+    for attrs in (
+        class_file.attributes,
+        *[m.attributes for m in class_file.methods],
+        *[f.attributes for f in class_file.fields],
+    ):
+        keep: list[Attribute] = []
+        for a in attrs:
+            if cp.utf8(a.name_index) in _METADATA_STRIP_NAMES:
+                stripped += 1
+            else:
+                keep.append(a)
+        attrs[:] = keep
+    return stripped
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +452,10 @@ def scramble_control_flow(class_file: ClassFile, seed: int) -> int:
     for method in class_file.methods:
         code = method.code()
         if code is None or code.exception_table:
+            continue
+        # <init> 的 locals[0] 在 super 构造调用前后由 uninitializedThis 变为
+        # this；SAME 帧无法表示该变化，打散会触发真实 JVM VerifyError。
+        if cp.utf8(method.name_index) == "<init>":
             continue
         if _has_smt(code, cp):
             continue

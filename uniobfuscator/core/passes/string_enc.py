@@ -77,18 +77,41 @@ def _real_value(raw: str, lang: str) -> str:
 
 class StringEncryptPass(ObfuscationPass):
     name = "strings"
-    description = "字符串 base64 加密"
+    description = "字符串加密（多算法 helper + 独立密钥拆分 + base64 双层）"
+
+    #: 各语言支持的编码算法（解码 helper 与之一一对应）
+    ALGOS = {
+        "python": ("xor", "add", "sub"),
+        "javascript": ("xor",),
+        "java": ("xor",),
+    }
 
     def run(self, src: EditableSource, adapter: LanguageAdapter) -> None:
         strings = adapter.string_nodes(src.root)
         if not strings:
             return
+        algos = self.ALGOS.get(adapter.name, ("xor",))
         # 注意：helper 名不能以双下划线开头（Python 类体内会发生名称改写 name mangling）
-        helper = f"_u{self.rng.randint(0, 0xFFFFFF):06x}"
-        if not adapter.inject_string_helper(src, adapter.string_helper(helper)):
+        helpers = [f"_u{self.rng.randint(0, 0xFFFFFF):06x}" for _ in algos]
+        if not adapter.inject_string_helper(src, adapter.string_helpers(helpers)):
             return  # 无法注入 helper（如无类声明的 Java 文件），跳过加密
         for node in strings:
             raw = node.text.decode("utf-8", "replace")
             value = _real_value(raw, adapter.name)
-            encoded = base64.b64encode(value.encode("utf-8")).decode("ascii")
-            src.replace_node(node, f'{helper}("{encoded}")')
+            if value == "":
+                continue  # 空字符串无需加密
+            # 每字符串独立随机密钥（1..255，避免 key=0 等同明文）
+            key = self.rng.randrange(1, 256)
+            algo = algos[self.rng.randrange(len(algos))]
+            if algo == "add":
+                data = bytes((b + key) % 256 for b in value.encode("utf-8"))
+            elif algo == "sub":
+                data = bytes((b - key) % 256 for b in value.encode("utf-8"))
+            else:
+                data = bytes(b ^ key for b in value.encode("utf-8"))
+            encoded = base64.b64encode(data).decode("ascii")
+            # 密钥拆分：字面量中不出现真实 key，运行时 (k1 + k2) % 256 还原
+            k1 = self.rng.randrange(1, 256)
+            k2 = (key - k1) % 256
+            helper = helpers[algos.index(algo)]
+            src.replace_node(node, f'{helper}("{encoded}", ({k1} + {k2}) % 256)')

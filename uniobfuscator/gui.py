@@ -35,6 +35,9 @@ TEXT_FEATURE_LABELS = {
     "strings": "字符串加密",
     "dead_code": "死代码注入",
     "arithmetic": "算术混淆",
+    "module_rename": "模块级名称重命名",
+    "control_flow": "控制流混淆",
+    "flatten": "控制流扁平化",
 }
 
 #: JAR 字节码混淆特性 -> 界面开关标签（strings 为两种形态共享，单独显示）
@@ -59,7 +62,8 @@ EXT_TO_LANG = {
 #: python/javascript 只做文本源码混淆；java 以 JAR 字节码混淆为主体
 #: （类名/包名/成员重命名、打散、元数据剥离等），并额外携带排除框。
 LANG_CONFIG_KEYS = {
-    "python": ["rename", "strings", "dead_code", "arithmetic"],
+    "python": ["rename", "strings", "dead_code", "arithmetic",
+               "module_rename", "control_flow", "flatten"],
     "javascript": ["rename", "strings", "dead_code", "arithmetic"],
     "java": ["strings", "java_arithmetic", "java_dead_code", "java_scramble",
              "java_rename", "java_member_rename", "java_repackage",
@@ -390,6 +394,9 @@ class UniObfuscatorApp:
             ("strings", self.sw_strings),
             ("dead_code", self.sw_dead_code),
             ("arithmetic", self.sw_arithmetic),
+            ("module_rename", self.sw_module_rename),
+            ("control_flow", self.sw_control_flow),
+            ("flatten", self.sw_flatten),
             ("java_arithmetic", self.sw_java_arithmetic),
             ("java_dead_code", self.sw_java_dead_code),
             ("java_scramble", self.sw_java_scramble),
@@ -450,10 +457,10 @@ class UniObfuscatorApp:
                 if item:
                     argv += ["--exclude", item]
         else:
-            # 文本源码 / 目录模式：只传该语言 features 支持的开关
+            # 文本源码 / 目录模式：只传该语言显示且支持的开关
             lang = self._current_lang() or "python"
             feats = features_for(lang) if lang in ("python", "javascript", "java") else {}
-            for key, label in TEXT_FEATURE_LABELS.items():
+            for key in LANG_CONFIG_KEYS.get(lang, []):
                 if not feats.get(key, True):
                     continue  # 语言不支持该 pass，不传
                 if not self._switches[key].value:

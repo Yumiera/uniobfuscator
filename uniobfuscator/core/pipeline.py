@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import os
 
+from .flatten import flatten_module
 from .passes import (
     ArithmeticPass,
+    ControlFlowPass,
     DeadCodePass,
+    ModuleRenamePass,
     ObfuscationPass,
     RenamePass,
     StringEncryptPass,
@@ -18,6 +21,9 @@ DEFAULT_OPTIONS = {
     "strings": True,
     "dead_code": True,
     "arithmetic": True,
+    "module_rename": False,
+    "control_flow": False,
+    "flatten": False,
     "seed": 0,
 }
 
@@ -33,6 +39,10 @@ def build_passes(options: dict) -> list[ObfuscationPass]:
         passes.append(DeadCodePass(seed))
     if options.get("arithmetic", DEFAULT_OPTIONS["arithmetic"]):
         passes.append(ArithmeticPass(seed))
+    if options.get("module_rename", DEFAULT_OPTIONS["module_rename"]):
+        passes.append(ModuleRenamePass(seed))
+    if options.get("control_flow", DEFAULT_OPTIONS["control_flow"]):
+        passes.append(ControlFlowPass(seed))
     return passes
 
 
@@ -44,7 +54,12 @@ def obfuscate(source: str, adapter: LanguageAdapter, options: dict | None = None
         raise ValueError(f"[{adapter.name}] 源码解析失败，存在语法错误")
     for p in build_passes(opts):
         p.run(src, adapter)
-    return src.apply()
+    result = src.apply()
+    # 控制流扁平化是独立后处理阶段：基于已完成全部字节编辑的中间文本
+    # 重新解析并按函数体重建状态机（仅 Python 支持，保证语义安全）。
+    if opts.get("flatten", DEFAULT_OPTIONS["flatten"]) and adapter.name == "python":
+        result = flatten_module(result, adapter, int(opts.get("seed", DEFAULT_OPTIONS["seed"])))
+    return result
 
 
 def obfuscate_file(

@@ -17,6 +17,13 @@ class PythonAdapter(LanguageAdapter):
     display_name = "Python"
     extensions = (".py",)
 
+    # Python 强化混淆：模块级名称重命名（仅私有名，public 保留）+ 控制流混淆
+    # 出厂默认开启（用户显式选择的能力）。
+    features: dict[str, bool] = {
+        "rename": True, "strings": True, "dead_code": True, "arithmetic": True,
+        "module_rename": True, "control_flow": True, "flatten": True,
+    }
+
     def language_func(self):
         return tree_sitter_python.language()
 
@@ -191,9 +198,34 @@ class PythonAdapter(LanguageAdapter):
     def string_helper(self, helper_name: str) -> str:
         return (
             "import base64 as __b64\n"
-            f"def {helper_name}(__s):\n"
-            f"    return __b64.b64decode(__s).decode('utf-8')\n"
+            f"def {helper_name}(__s, __k):\n"
+            "    __b = bytes(__c ^ __k for __c in __b64.b64decode(__s))\n"
+            "    return __b.decode('utf-8')\n"
         )
+
+    def string_helpers(self, helper_names: list[str]) -> str:
+        """生成多算法解码 helper：XOR / 加偏移 / 减偏移。
+
+        每条字符串随机选用一个算法，静态分析必须逐一尝试三种算法。
+        """
+        templates = [
+            # XOR
+            "def {n}(__s, __k):\n"
+            "    __b = bytes(__c ^ __k for __c in __b64.b64decode(__s))\n"
+            "    return __b.decode('utf-8')",
+            # 加偏移编码 -> 解码减偏移
+            "def {n}(__s, __k):\n"
+            "    __b = bytes((__c - __k) % 256 for __c in __b64.b64decode(__s))\n"
+            "    return __b.decode('utf-8')",
+            # 减偏移编码 -> 解码加偏移
+            "def {n}(__s, __k):\n"
+            "    __b = bytes((__c + __k) % 256 for __c in __b64.b64decode(__s))\n"
+            "    return __b.decode('utf-8')",
+        ]
+        parts = ["import base64 as __b64\n"]
+        for name, tmpl in zip(helper_names, templates):
+            parts.append(tmpl.format(n=name) + "\n")
+        return "".join(parts)
 
     def inject_string_helper(self, src: EditableSource, helper_code: str) -> bool:
         # 若文件带 BOM（utf-8-sig），注入到 BOM 之后
@@ -218,3 +250,113 @@ class PythonAdapter(LanguageAdapter):
         line_prefix = src.bytes[:start].rsplit(b"\n", 1)[-1].decode("utf-8")
         indent = line_prefix if line_prefix.strip() == "" else "    "
         src.replace(start, start, self.dead_code_snippet(indent))
+
+    # ---------------------------------------------------------------- 模块级
+    def module_scope_declarations(self, root: Node) -> list[Node]:
+        """模块级自定义声明：类名 / 函数名 / 全局变量赋值左侧的 identifier。
+
+        只收集"模块内自定义"的名字：
+        - class_definition / function_definition 声明名
+        - 模块级 assignment / augmented_assignment 左侧的 identifier
+        - 排除 import 绑定（import 名是外来名字，改它不影响本模块可读性
+          且会破坏跨文件引用）与 dunder（__name__/__all__ 等）。
+        """
+        decls: list[Node] = []
+        for stmt in root.children:
+            if stmt.type in ("class_definition", "function_definition"):
+                ids = [c for c in stmt.children if c.type == "identifier"]
+                if ids:
+                    decls.append(ids[0])
+                continue
+            if stmt.type == "import_statement":
+                continue
+            if stmt.type == "import_from_statement":
+                continue
+            if stmt.type in {"expression_statement", "assignment",
+                             "augmented_assignment"}:
+                assign = stmt
+                if stmt.type == "expression_statement":
+                    assign = next(
+                        (c for c in stmt.children if c.type == "assignment"), None)
+                    if assign is None:
+                        continue
+                left = assign.children[0]
+                for n in self._left_identifiers(left):
+                    decls.append(n)
+        # 排除 dunder 与 import 绑定名（防误伤）
+        out: list[Node] = []
+        for n in decls:
+            text = n.text.decode("utf-8", "replace")
+            if text.startswith("__") and text.endswith("__"):
+                continue
+            if not text.isidentifier():
+                continue
+            out.append(n)
+        return out
+
+    @staticmethod
+    def _left_identifiers(left: Node) -> list[Node]:
+        out = []
+        if left.type == "identifier":
+            out.append(left)
+        elif left.type in {"tuple_pattern", "list_pattern", "pattern_list"}:
+            for c in left.children:
+                out.extend(PythonAdapter._left_identifiers(c))
+        return out
+
+    def class_nodes(self, root: Node) -> list[Node]:
+        return nodes_of_type(root, {"class_definition"})
+
+    def class_body_declarations(self, cls: Node) -> list[Node]:
+        """类体内声明的 identifier：赋值左侧、方法/嵌套类声明名。
+
+        类属性与模块级同名时会遮蔽模块级引用（类体内 _x 指向类属性），
+        模块级重命名必须跳过这些位置。
+        """
+        body = next((c for c in cls.children if c.type == "block"), None)
+        if body is None:
+            return []
+        out: list[Node] = []
+        for stmt in body.children:
+            if stmt.type in ("function_definition", "class_definition"):
+                ids = [c for c in stmt.children if c.type == "identifier"]
+                if ids:
+                    out.append(ids[0])
+                continue
+            if stmt.type in {"expression_statement", "assignment",
+                             "augmented_assignment"}:
+                assign = stmt
+                if stmt.type == "expression_statement":
+                    assign = next(
+                        (c for c in stmt.children if c.type == "assignment"), None)
+                    if assign is None:
+                        continue
+                left = assign.children[0]
+                for n in self._left_identifiers(left):
+                    out.append(n)
+        return out
+
+    # ---------------------------------------------------------------- 控制流
+    def control_flow_snippet(self, indent: str, a: int, b: int) -> str:
+        """复杂不透明谓词：随机算术恒假条件 + 嵌套诱饵代码。
+
+        例如：if (a * b) + 1 == a * b:  恒假（a*b+1 必不等于 a*b）
+        a/b 由 pass 的 rng 生成（可复现）；块内放看似真实的局部变量
+        声明与字符串操作，增加静态分析难度。
+        """
+        inner = indent + "    "
+        return (
+            f"if ({a} * {b}) + 1 == {a} * {b}:\n"
+            f"{inner}_dc = ({a} + {b}) * 2\n"
+            f"{inner}_dc = str(_dc).join(['x', 'y'])\n"
+            f"{inner}if len(_dc) < 0:\n"
+            f"{inner}    _dc = _dc[::-1]\n"
+            f"{indent}"
+        )
+
+    def insert_control_flow_at_function_head(self, src: EditableSource, fn: Node,
+                                             a: int, b: int) -> None:
+        start, _ = self.function_body_range(fn)
+        line_prefix = src.bytes[:start].rsplit(b"\n", 1)[-1].decode("utf-8")
+        indent = line_prefix if line_prefix.strip() == "" else "    "
+        src.replace(start, start, self.control_flow_snippet(indent, a, b))

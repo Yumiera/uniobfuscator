@@ -5,6 +5,7 @@
 
 - 文本源文件（.py/.js/.java）：
     --rename / --strings / --dead-code / --arithmetic
+    --module-rename / --control-flow（Python 强化混淆，默认按语言能力开启）
     各语言可裁剪能力或调整默认值（见 languages 配置段）；
     传了 JAR 专属的 --java-* 开关会提示"仅适用于 JAR 字节码模式"并忽略。
 - JAR 字节码（.jar）：
@@ -74,7 +75,8 @@ BINARY_ARTIFACT_EXTS = frozenset({
 })
 
 #: 文本语言专属开关（JAR 模式不适用；strings 为两种形态共享）
-TEXT_ONLY_KEYS = frozenset({"rename", "dead_code", "arithmetic"})
+TEXT_ONLY_KEYS = frozenset({"rename", "dead_code", "arithmetic",
+                            "module_rename", "control_flow", "flatten"})
 #: JAR 字节码专属开关（文本模式不适用）
 JAR_ONLY_KEYS = frozenset({
     "java_arithmetic", "java_dead_code", "java_scramble", "java_rename",
@@ -129,6 +131,24 @@ def _build_parser() -> argparse.ArgumentParser:
             action=argparse.BooleanOptionalAction, default=None,
             help=f"启用{flag.replace('-', '_')}混淆（默认开启；用 --no-{flag} 关闭）",
         )
+    p.add_argument(
+        "--module-rename", dest="module_rename",
+        action=argparse.BooleanOptionalAction, default=None,
+        help="模块级私有名称重命名（类/函数/全局变量，Python 默认开启；"
+             "用 --no-module-rename 关闭）",
+    )
+    p.add_argument(
+        "--control-flow", dest="control_flow",
+        action=argparse.BooleanOptionalAction, default=None,
+        help="控制流混淆（不透明谓词 + 诱饵代码，Python 默认开启；"
+             "用 --no-control-flow 关闭）",
+    )
+    p.add_argument(
+        "--flatten", dest="flatten",
+        action=argparse.BooleanOptionalAction, default=None,
+        help="控制流扁平化（函数体改 while+状态机分派，Python 默认开启；"
+             "用 --no-flatten 关闭）",
+    )
     p.add_argument("--list-languages", action="store_true", help="列出支持的语言")
     return p
 
@@ -150,14 +170,16 @@ def _build_options(
     options = dict(DEFAULT_OPTIONS)  # 内置默认
     if features:
         options.update(features)  # 语言/形态出厂默认（覆盖内置默认）
-    for key in ("seed", "rename", "strings", "dead_code", "arithmetic", "exclude",
+    for key in ("seed", "rename", "strings", "dead_code", "arithmetic",
+                "module_rename", "control_flow", "flatten", "exclude",
                 "java_arithmetic", "java_dead_code", "java_scramble", "java_rename",
                 "java_member_rename", "java_repackage", "java_strip_metadata"):
         if key in (global_cfg or {}):
             options[key] = global_cfg[key]  # 全局配置
     if per_language and lang_name:
         options.update(per_language.get(lang_name, {}))  # 按语言配置
-    for key in ("seed", "rename", "strings", "dead_code", "arithmetic", "exclude",
+    for key in ("seed", "rename", "strings", "dead_code", "arithmetic",
+                "module_rename", "control_flow", "flatten", "exclude",
                 "java_arithmetic", "java_dead_code", "java_scramble", "java_rename",
                 "java_member_rename", "java_repackage", "java_strip_metadata"):
         value = getattr(args, key)

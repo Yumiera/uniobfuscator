@@ -46,7 +46,8 @@ DEFAULT_CONFIG_FILE = "uniobfuscator.toml"
 #: 顶层（全局）允许出现的字段
 GLOBAL_KEYS = frozenset({
     "path", "language", "output", "seed", "stdout",
-    "rename", "strings", "dead_code", "arithmetic", "languages",
+    "rename", "strings", "dead_code", "arithmetic",
+    "module_rename", "control_flow", "flatten", "languages",
     "exclude",
     "java_arithmetic", "java_dead_code", "java_scramble", "java_rename",
     "java_member_rename", "java_repackage", "java_strip_metadata",
@@ -55,6 +56,7 @@ GLOBAL_KEYS = frozenset({
 #: 按语言分组里允许出现的字段
 LANGUAGE_KEYS = frozenset({
     "seed", "rename", "strings", "dead_code", "arithmetic",
+    "module_rename", "control_flow", "flatten",
 })
 
 #: 默认配置模板（程序自动生成 config/uniobfuscator.toml 时写入）
@@ -83,6 +85,9 @@ rename = true               # 标识符重命名（函数内局部变量/参数�
 strings = true              # 字符串加密（JAR 模式同样适用）
 dead_code = true            # 死代码注入
 arithmetic = true           # 算术混淆
+module_rename = true        # 模块级私有名称重命名（仅 Python：类/函数/全局变量）
+control_flow = true         # 控制流混淆（仅 Python：不透明谓词 + 诱饵代码）
+flatten = true              # 控制流扁平化（仅 Python：函数体改 while+状态机分派）
 
 # JAR 模式排除列表（不混淆的类/包，原样保留；用于反射加载、资源路径等类）
 # 格式：精确类名 'com.foo.Secret' 或包前缀 'com.foo.secret.*'（含子包）
@@ -98,7 +103,8 @@ arithmetic = true           # 算术混淆
 # java_member_rename = false  # 私有方法/字段重命名（Serializable 字段自动保护）
 
 # ---------------- 按语言配置（覆盖对应语言的全局默认） ----------------
-# 每个语言段可单独设置：seed / rename / strings / dead_code / arithmetic。
+# 每个语言段可单独设置：seed / rename / strings / dead_code / arithmetic
+# / module_rename / control_flow / flatten。
 # 即"同一种输入，不同语言可用不同开关组合"。
 #
 # [languages.python]

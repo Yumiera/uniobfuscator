@@ -108,10 +108,10 @@ class JavaScriptAdapter(LanguageAdapter):
 
     def string_helper(self, helper_name: str) -> str:
         return (
-            f"function {helper_name}(__s) {{\n"
+            f"function {helper_name}(__s, __k) {{\n"
             "  const __b = atob(__s);\n"
             "  const __u8 = new Uint8Array(__b.length);\n"
-            "  for (let __i = 0; __i < __b.length; __i++) __u8[__i] = __b.charCodeAt(__i);\n"
+            "  for (let __i = 0; __i < __b.length; __i++) __u8[__i] = __b.charCodeAt(__i) ^ __k;\n"
             "  return new TextDecoder().decode(__u8);\n"
             "}\n"
         )

@@ -92,9 +92,10 @@ class JavaAdapter(LanguageAdapter):
 
     def string_helper(self, helper_name: str) -> str:
         return (
-            f"private static String {helper_name}(String __s) {{\n"
-            "    return new String(java.util.Base64.getDecoder().decode(__s), "
-            "java.nio.charset.StandardCharsets.UTF_8);\n"
+            f"private static String {helper_name}(String __s, int __k) {{\n"
+            "    byte[] __b = java.util.Base64.getDecoder().decode(__s);\n"
+            "    for (int __i = 0; __i < __b.length; __i++) __b[__i] ^= (byte) __k;\n"
+            "    return new String(__b, java.nio.charset.StandardCharsets.UTF_8);\n"
             "}\n"
         )
 
